@@ -248,11 +248,8 @@ func TestGatewayLateOldTokenFailureDoesNotRefreshAgain(t *testing.T) {
 	fresh.AccessToken = "fresh-token"
 	fresh.AccessTokenExpiresAt = now.Add(2 * time.Hour)
 	var refreshCalls atomic.Int32
-	refreshStarted := make(chan struct{})
 	manager := token.New(nil, func(store.Credentials) error { return nil }, func(context.Context, store.Credentials) (store.Credentials, error) {
-		if refreshCalls.Add(1) == 1 {
-			close(refreshStarted)
-		}
+		refreshCalls.Add(1)
 		return fresh, nil
 	}, func() time.Time { return now }, 7*24*time.Hour)
 	if err := manager.Set(old); err != nil {
@@ -277,15 +274,24 @@ func TestGatewayLateOldTokenFailureDoesNotRefreshAgain(t *testing.T) {
 	close(start)
 	<-client.secondOldReady
 	select {
-	case <-refreshStarted:
+	case err := <-results:
+		if err != nil {
+			t.Fatalf("first ListDevices() error = %v", err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("token refresh did not start")
+		t.Fatal("first request did not finish refresh and retry")
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls before late response = %d, want 1", got)
 	}
 	close(client.releaseSecond)
-	for range 2 {
-		if err := <-results; err != nil {
-			t.Fatalf("ListDevices() error = %v", err)
+	select {
+	case err := <-results:
+		if err != nil {
+			t.Fatalf("second ListDevices() error = %v", err)
 		}
+	case <-time.After(time.Second):
+		t.Fatal("late-response request did not finish")
 	}
 	if got := refreshCalls.Load(); got != 1 {
 		t.Fatalf("refresh calls = %d, want 1", got)
