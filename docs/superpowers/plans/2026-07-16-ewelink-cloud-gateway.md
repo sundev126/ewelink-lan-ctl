@@ -317,7 +317,7 @@ Cover redirect, unique state, missing/unknown/expired/replayed state, exchange f
 
 - [ ] **Step 5: Implement OAuth state lifecycle**
 
-Store 32-byte base64url states in a mutex-protected in-memory map for 10 minutes. Consume before exchange. Callback validates `code`, `region`, and `state`, exchanges the code, and calls `TokenSetter.Set`.
+Store 32-byte base64url states in a mutex-protected in-memory map for 10 minutes. Consume before exchange. Callback validates `code`, `region`, and `state`, exchanges the code, and calls `TokenSetter.Set`. Per the owner's response-format decision, callback failures return the stable JSON error envelope and callback success returns only minimal HTML.
 
 - [ ] **Step 6: Verify and commit**
 

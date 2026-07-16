@@ -71,7 +71,7 @@ The App ID and App Secret identify the developer application but do not authoriz
 4. The callback rejects missing, expired, unknown, or already-used state values.
 5. It exchanges the short-lived code for access and refresh tokens using the regional API host.
 6. The service atomically persists the region, tokens, and expiry timestamps.
-7. The callback displays a minimal success or failure page without displaying sensitive values.
+7. By owner decision, callback failures use the same stable JSON error envelope as the REST API, while callback success displays only a minimal HTML confirmation without sensitive values.
 
 The target is a headless Debian 12 server while the registered callback is loopback. Initial authorization therefore uses a client-side SSH tunnel:
 
