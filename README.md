@@ -7,13 +7,13 @@
 
 ## 安全模型
 
-整个服务特意不设身份认证。任何能访问端口 `33998` 的人都可以列出支持的设备、打开或关闭设备，以及调用 `/oauth/start` 和 `/callback` 将服务持久重新绑定到另一个 eWeLink 账号。请将每个路由限制在受信任的 LAN 或 VPN 内，或者将整个服务置于经过身份认证的反向代理或同等访问控制之后。不要将端口 `33998` 直接发布到互联网。OAuth 的一次性 `state` 仅用于防止回调关联错误和重放；它不会对调用者进行身份认证，也不能阻止可访问服务的客户端启动新的账号绑定。
+整个服务特意不设身份认证。任何能访问端口 `33998` 的人都可以列出支持的设备、打开或关闭设备，以及调用 `/oauth/start` 和 `/callback` 将服务重新绑定到另一个 eWeLink 账号，并持久保存新的绑定关系。请将每个路由限制在受信任的 LAN 或 VPN 内，或者将整个服务置于经过身份认证的反向代理或同等访问控制之后。不要将端口 `33998` 直接发布到互联网。OAuth 的一次性 `state` 仅用于防止回调关联错误和重放；它不会对调用者进行身份认证，也不能阻止可访问服务的客户端启动新的账号绑定。
 
 服务将 OAuth 凭据持久化在 `state.json` 中。请将该文件作为机密保护。设备元数据和设备状态不会被缓存。
 
 ## 配置
 
-复制占位配置并填入新轮换的凭据：
+复制占位配置并填入轮换后的新凭据：
 
 ```bash
 cp .env.example .env
@@ -25,7 +25,7 @@ chmod 600 .env
 | 变量 | 必填项/默认值 | 用途 |
 | --- | --- | --- |
 | `EWELINK_APP_ID` | 必填 | eWeLink 开发者应用 ID |
-| `EWELINK_APP_SECRET` | 必填 | 新轮换的开发者 App Secret |
+| `EWELINK_APP_SECRET` | 必填 | 轮换后的开发者 App Secret |
 | `EWELINK_CALLBACK_URL` | `http://127.0.0.1:33998/callback` | 已注册的 OAuth 重定向 URL；必须与开发者应用完全匹配 |
 | `EWELINK_LISTEN_ADDR` | `:33998` | HTTP 监听地址 |
 | `EWELINK_STATE_FILE` | `./data/state.json` | OAuth 凭据存储位置 |
@@ -42,7 +42,7 @@ chmod 600 .env
 ```bash
 sudo apt update
 sudo apt install -y ca-certificates
-go version  # 必须报告 go1.22 或更高版本
+go version  # 输出必须显示 go1.22 或更高版本
 go test ./...
 CGO_ENABLED=0 go build -trimpath -o ewelink-lan-ctl ./cmd/ewelink-lan-ctl
 ```
@@ -86,7 +86,7 @@ Docker 在 Debian Bookworm 上使用 Go 1.22 构建并测试静态二进制文�
 ```bash
 cp .env.example .env
 chmod 600 .env
-# 编辑 .env 并填入新轮换的 App Secret。
+# 编辑 .env 并填入轮换后的新 App Secret。
 docker compose up -d --build
 docker compose logs -f ewelink-lan-ctl
 ```
@@ -201,8 +201,8 @@ curl --fail-with-body \
 简而言之，为每个 device ID 重复设置这一对自动化：
 
 ```text
-Below 20% -> PUT /api/v1/devices/<DEVICE_ID>/switch {"state":"on"}
-Above 80% -> PUT /api/v1/devices/<DEVICE_ID>/switch {"state":"off"}
+低于 20% -> PUT /api/v1/devices/<DEVICE_ID>/switch {"state":"on"}
+高于 80% -> PUT /api/v1/devices/<DEVICE_ID>/switch {"state":"off"}
 ```
 
 不要将一个插座的 `device_id` 用于另一台 iPhone。
