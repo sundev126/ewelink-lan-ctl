@@ -3,7 +3,9 @@ package token
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -133,6 +135,7 @@ func TestConcurrentAccessSharesRefreshResult(t *testing.T) {
 	ready.Wait()
 	close(gate)
 	<-started
+	waitForRefreshWaiters(t, m, count-1)
 	close(release)
 	for i := 0; i < count; i++ {
 		if err := <-results; err != nil {
@@ -223,6 +226,214 @@ func TestExpiredRefreshTokenRequiresOAuth(t *testing.T) {
 	}
 }
 
+func TestAccessRequiresOAuthWhenRefreshExpiredBeforeAccess(t *testing.T) {
+	old := credentials(testNow.Add(24*time.Hour), testNow.Add(-time.Minute))
+	var refreshCalls int
+	m := newTestManager(nil, nil, func(context.Context, store.Credentials) (store.Credentials, error) {
+		refreshCalls++
+		return store.Credentials{}, errors.New("unexpected refresh")
+	}, func() time.Time { return testNow })
+	m.setCurrentForTest(old)
+
+	_, _, err := m.Access(context.Background())
+	if !errors.Is(err, ErrOAuthRequired) {
+		t.Fatalf("Access() error = %v, want ErrOAuthRequired", err)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("refresh calls = %d, want 0", refreshCalls)
+	}
+}
+
+func TestPermanentRefreshRejectionMarksOAuthRequiredWithoutSaving(t *testing.T) {
+	old := credentials(testNow.Add(time.Minute), testNow.Add(30*24*time.Hour))
+	var saved []store.Credentials
+	m := newTestManager(nil, func(got store.Credentials) error {
+		saved = append(saved, got)
+		return nil
+	}, func(context.Context, store.Credentials) (store.Credentials, error) {
+		return store.Credentials{}, fmt.Errorf("provider rejected refresh token: %w", ErrOAuthRequired)
+	}, func() time.Time { return testNow })
+	if err := m.Set(old); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.ForceRefresh(context.Background()); !errors.Is(err, ErrOAuthRequired) {
+		t.Fatalf("ForceRefresh() error = %v, want ErrOAuthRequired", err)
+	}
+	if m.Health() {
+		t.Fatal("Health() = true after permanent rejection")
+	}
+	if _, _, err := m.Access(context.Background()); !errors.Is(err, ErrOAuthRequired) {
+		t.Fatalf("subsequent Access() error = %v, want ErrOAuthRequired", err)
+	}
+	if len(saved) != 1 || saved[0] != old {
+		t.Fatalf("durable saves = %#v, want only original credentials", saved)
+	}
+	if got := m.current(); got != old {
+		t.Fatalf("retained credentials = %#v, want %#v", got, old)
+	}
+}
+
+func TestSetSupersedesBlockedLoad(t *testing.T) {
+	loaded := namedCredentials("loaded", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	newer := namedCredentials("newer", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	saveStarted := make(chan struct{})
+	m := newTestManager(func() (store.Credentials, error) {
+		close(loadStarted)
+		<-releaseLoad
+		return loaded, nil
+	}, func(store.Credentials) error {
+		close(saveStarted)
+		return nil
+	}, nil, func() time.Time { return testNow })
+
+	loadDone := make(chan error, 1)
+	go func() { loadDone <- m.Load(context.Background()) }()
+	<-loadStarted
+	setDone := make(chan error, 1)
+	go func() { setDone <- m.Set(newer) }()
+	<-saveStarted
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	close(releaseLoad)
+	if err := <-loadDone; err != nil {
+		t.Fatal(err)
+	}
+	region, token, err := m.Access(context.Background())
+	if err != nil || region != newer.Region || token != newer.AccessToken {
+		t.Fatalf("Access() = %q, %q, %v; want newer credentials", region, token, err)
+	}
+}
+
+func TestLoadDuringBlockedSetCannotPublishStaleCredentials(t *testing.T) {
+	old := namedCredentials("old", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	newer := namedCredentials("newer", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	var saves int
+	m := newTestManager(func() (store.Credentials, error) { return old, nil }, func(store.Credentials) error {
+		saves++
+		if saves == 1 {
+			return nil
+		}
+		close(saveStarted)
+		<-releaseSave
+		return nil
+	}, nil, func() time.Time { return testNow })
+	if err := m.Set(old); err != nil {
+		t.Fatal(err)
+	}
+
+	setDone := make(chan error, 1)
+	go func() { setDone <- m.Set(newer) }()
+	<-saveStarted
+	if err := m.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseSave)
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	region, token, err := m.Access(context.Background())
+	if err != nil || region != newer.Region || token != newer.AccessToken {
+		t.Fatalf("Access() = %q, %q, %v; want newer credentials", region, token, err)
+	}
+}
+
+func TestSetSupersedesBlockedRefreshWithoutPersistingStaleResult(t *testing.T) {
+	old := namedCredentials("old", testNow.Add(time.Minute), testNow.Add(30*24*time.Hour))
+	newer := namedCredentials("newer", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	refreshed := namedCredentials("refreshed-old", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var saveMu sync.Mutex
+	var saved []store.Credentials
+	m := newTestManager(nil, func(got store.Credentials) error {
+		saveMu.Lock()
+		saved = append(saved, got)
+		saveMu.Unlock()
+		return nil
+	}, func(context.Context, store.Credentials) (store.Credentials, error) {
+		close(refreshStarted)
+		<-releaseRefresh
+		return refreshed, nil
+	}, func() time.Time { return testNow })
+	if err := m.Set(old); err != nil {
+		t.Fatal(err)
+	}
+
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- m.ForceRefresh(context.Background()) }()
+	<-refreshStarted
+	setDone := make(chan error, 1)
+	go func() { setDone <- m.Set(newer) }()
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	close(releaseRefresh)
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("superseded ForceRefresh() error = %v", err)
+	}
+
+	saveMu.Lock()
+	gotSaved := append([]store.Credentials(nil), saved...)
+	saveMu.Unlock()
+	if len(gotSaved) != 2 || gotSaved[0] != old || gotSaved[1] != newer {
+		t.Fatalf("durable saves = %#v, want old then newer only", gotSaved)
+	}
+	if got := m.current(); got != newer {
+		t.Fatalf("current credentials = %#v, want newer", got)
+	}
+}
+
+func TestBlockedRefreshWaitersShareErrorAndCanceledWaiterCanLeave(t *testing.T) {
+	old := credentials(testNow.Add(time.Minute), testNow.Add(30*24*time.Hour))
+	wantErr := errors.New("temporary refresh failure")
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var calls atomic.Int32
+	m := newTestManager(nil, nil, func(context.Context, store.Credentials) (store.Credentials, error) {
+		calls.Add(1)
+		close(refreshStarted)
+		<-releaseRefresh
+		return store.Credentials{}, wantErr
+	}, func() time.Time { return testNow })
+	if err := m.Set(old); err != nil {
+		t.Fatal(err)
+	}
+
+	const waiters = 4
+	results := make(chan error, waiters+1)
+	go func() { _, _, err := m.Access(context.Background()); results <- err }()
+	<-refreshStarted
+	for i := 0; i < waiters; i++ {
+		go func() { _, _, err := m.Access(context.Background()); results <- err }()
+	}
+	waitForRefreshWaiters(t, m, waiters)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := m.Access(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter error = %v, want context.Canceled", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("refresh calls with canceled waiter = %d, want 1", calls.Load())
+	}
+
+	close(releaseRefresh)
+	for i := 0; i < waiters+1; i++ {
+		if err := <-results; !errors.Is(err, wantErr) {
+			t.Fatalf("shared refresh error = %v, want %v", err, wantErr)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("refresh calls = %d, want 1", calls.Load())
+	}
+}
+
 func TestHealthReportsExpiredAccessAsRefreshable(t *testing.T) {
 	old := credentials(testNow.Add(-time.Minute), testNow.Add(24*time.Hour))
 	m := newTestManager(nil, nil, nil, func() time.Time { return testNow })
@@ -263,4 +474,29 @@ func (m *Manager) setCurrentForTest(credentials store.Credentials) {
 	m.credentials = credentials
 	m.hasCredentials = true
 	m.mu.Unlock()
+}
+
+func namedCredentials(name string, accessExpiry, refreshExpiry time.Time) store.Credentials {
+	credentials := credentials(accessExpiry, refreshExpiry)
+	credentials.Region = name + "-region"
+	credentials.AccessToken = name + "-access"
+	credentials.RefreshToken = name + "-refresh"
+	return credentials
+}
+
+func waitForRefreshWaiters(t *testing.T, m *Manager, want int) {
+	t.Helper()
+	for i := 0; i < 10000; i++ {
+		m.mu.Lock()
+		got := 0
+		if m.inFlight != nil {
+			got = m.inFlight.waiters
+		}
+		m.mu.Unlock()
+		if got >= want {
+			return
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("in-flight refresh waiters did not reach %d", want)
 }
