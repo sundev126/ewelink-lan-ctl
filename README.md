@@ -139,6 +139,10 @@ curl --fail-with-body "$BASE_URL/api/v1/devices"
 # {"devices":[{"device_id":"1000123456","name":"iPhone Charger","online":true,"state":"off","uiid":1,"model":"example-model"}]}
 ```
 
+- 每次列举设备都会实时遍历已授权账号下的全部家庭，不缓存家庭、设备元数据或状态。
+- 对使用 `params.switches` 的设备，服务只读取和控制 `outlet: 0`；REST API 仍将设备表现为单个 `on|off` 开关，不暴露 outlet 参数。
+- 每次设置开关前都会实时读取设备元数据以选择正确的云端协议，因此一次控制通常产生一次读取请求和一次写入请求。
+
 读取一个设备的当前状态：
 
 ```bash

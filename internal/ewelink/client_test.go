@@ -400,30 +400,77 @@ func TestClientGetDeviceReturnsTypedLocalErrors(t *testing.T) {
 	}
 }
 
-func TestClientSetSwitchSendsControlWithoutStatusRead(t *testing.T) {
-	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		assertBearerHeaders(t, r)
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if r.Method != http.MethodPost || r.URL.Path != "/v2/device/thing/status" {
-			t.Errorf("request = %s %s, want POST /v2/device/thing/status", r.Method, r.URL.Path)
-		}
-		if got, want := string(body), `{"type":1,"id":"device-1","params":{"switch":"on"}}`; got != want {
-			t.Errorf("body = %q, want %q", got, want)
-		}
-		io.WriteString(w, `{"error":0,"msg":"","data":{}}`)
-	}))
-	defer server.Close()
-
-	if err := testBearerClient(server.URL, time.Nanosecond).SetSwitch(context.Background(), "us", "access-token", "device-1", "on"); err != nil {
-		t.Fatalf("SetSwitch() error = %v", err)
+func TestClientSetSwitchUsesDeviceProtocol(t *testing.T) {
+	tests := []struct {
+		name        string
+		deviceID    string
+		state       string
+		thingJSON   string
+		wantControl string
+	}{
+		{
+			name:        "owned scalar",
+			deviceID:    "device-1",
+			state:       "off",
+			thingJSON:   `{"itemType":1,"itemData":{"deviceid":"device-1","params":{"switch":"on"}}}`,
+			wantControl: `{"type":1,"id":"device-1","params":{"switch":"off"}}`,
+		},
+		{
+			name:        "owned outlet zero",
+			deviceID:    "device-2",
+			state:       "on",
+			thingJSON:   `{"itemType":1,"itemData":{"deviceid":"device-2","params":{"switches":[{"outlet":0,"switch":"off"}]}}}`,
+			wantControl: `{"type":1,"id":"device-2","params":{"switches":[{"outlet":0,"switch":"on"}]}}`,
+		},
+		{
+			name:        "shared outlet zero",
+			deviceID:    "device-3",
+			state:       "off",
+			thingJSON:   `{"itemType":2,"itemData":{"deviceid":"device-3","params":{"switches":[{"outlet":0,"switch":"on"}]}}}`,
+			wantControl: `{"type":2,"id":"device-3","params":{"switches":[{"outlet":0,"switch":"off"}]}}`,
+		},
 	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("request count = %d, want exactly 1", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				request := requests.Add(1)
+				assertBearerHeaders(t, r)
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch request {
+				case 1:
+					if r.Method != http.MethodPost || r.URL.Path != "/v2/device/thing" {
+						t.Fatalf("first request = %s %s, want POST /v2/device/thing", r.Method, r.URL.Path)
+					}
+					want := fmt.Sprintf(`{"thingList":[{"itemType":1,"id":%q},{"itemType":2,"id":%q}]}`, tt.deviceID, tt.deviceID)
+					if got := string(body); got != want {
+						t.Errorf("read body = %q, want %q", got, want)
+					}
+					fmt.Fprintf(w, `{"error":0,"data":{"thingList":[%s]}}`, tt.thingJSON)
+				case 2:
+					if r.Method != http.MethodPost || r.URL.Path != "/v2/device/thing/status" {
+						t.Fatalf("second request = %s %s, want POST /v2/device/thing/status", r.Method, r.URL.Path)
+					}
+					if got := string(body); got != tt.wantControl {
+						t.Errorf("control body = %q, want %q", got, tt.wantControl)
+					}
+					io.WriteString(w, `{"error":0,"data":{}}`)
+				default:
+					t.Fatalf("unexpected request %d after state write", request)
+				}
+			}))
+			defer server.Close()
+
+			if err := testBearerClient(server.URL, time.Nanosecond).SetSwitch(context.Background(), "us", "access-token", tt.deviceID, tt.state); err != nil {
+				t.Fatalf("SetSwitch() error = %v", err)
+			}
+			if got := requests.Load(); got != 2 {
+				t.Fatalf("request count = %d, want one read and one write", got)
+			}
+		})
 	}
 }
 
@@ -438,6 +485,48 @@ func TestClientSetSwitchRejectsInvalidStateLocally(t *testing.T) {
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("request count = %d, want 0", got)
+	}
+}
+
+func TestClientSetSwitchPreservesPreReadErrorsWithoutWriting(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		want     error
+		wantCode int
+	}{
+		{name: "device not found", response: `{"error":0,"data":{"thingList":[]}}`, want: ErrDeviceNotFound},
+		{name: "unsupported device", response: `{"error":0,"data":{"thingList":[{"itemType":1,"itemData":{"deviceid":"device","params":{"switches":[]}}}]}}`, want: ErrUnsupportedDevice},
+		{name: "upstream error", response: `{"error":503,"msg":"unavailable","data":{}}`, wantCode: 503},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := requests.Add(1); got != 1 {
+					t.Fatalf("unexpected state write request %d to %s", got, r.URL.Path)
+				}
+				if r.URL.Path != "/v2/device/thing" {
+					t.Fatalf("request path = %q, want metadata read", r.URL.Path)
+				}
+				io.WriteString(w, tt.response)
+			}))
+			defer server.Close()
+
+			err := testBearerClient(server.URL, time.Nanosecond).SetSwitch(context.Background(), "as", "access-token", "device", "on")
+			if tt.want != nil && !errors.Is(err, tt.want) {
+				t.Fatalf("SetSwitch() error = %v, want errors.Is(_, %v)", err, tt.want)
+			}
+			if tt.wantCode != 0 {
+				var upstream *UpstreamError
+				if !errors.As(err, &upstream) || upstream.Code != tt.wantCode {
+					t.Fatalf("SetSwitch() error = %T %v, want preserved UpstreamError code %d", err, err, tt.wantCode)
+				}
+			}
+			if got := requests.Load(); got != 1 {
+				t.Fatalf("request count = %d, want metadata read only", got)
+			}
+		})
 	}
 }
 
@@ -500,7 +589,11 @@ func TestClientErrorRequiresNumericEnvelopeErrorOnRead(t *testing.T) {
 func TestClientErrorRequiresNumericEnvelopeErrorOnWrite(t *testing.T) {
 	for _, response := range []string{`{}`, `{"error":null,"data":{}}`} {
 		t.Run(response, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/v2/device/thing" {
+					io.WriteString(w, `{"error":0,"data":{"thingList":[{"itemType":1,"itemData":{"deviceid":"id","params":{"switch":"off"}}}]}}`)
+					return
+				}
 				io.WriteString(w, response)
 			}))
 			defer server.Close()
@@ -514,9 +607,13 @@ func TestClientErrorRequiresNumericEnvelopeErrorOnWrite(t *testing.T) {
 
 func TestClientLimitWaitHonorsCancellation(t *testing.T) {
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		io.WriteString(w, `{"error":0,"msg":"","data":{}}`)
+		if r.URL.Path == "/v2/device/thing" {
+			io.WriteString(w, `{"error":0,"data":{"thingList":[{"itemType":1,"itemData":{"deviceid":"id","params":{"switch":"off"}}}]}}`)
+			return
+		}
+		io.WriteString(w, `{"error":0,"data":{}}`)
 	}))
 	defer server.Close()
 
@@ -530,16 +627,20 @@ func TestClientLimitWaitHonorsCancellation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("second SetSwitch() error = %v, want context deadline exceeded", err)
 	}
-	if got := requests.Load(); got != 1 {
-		t.Fatalf("request count = %d, want 1", got)
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("request count = %d, want initial read and write only", got)
 	}
 }
 
 func TestClientLimitDefaultGateIsProcessWide(t *testing.T) {
 	var requests atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
-		io.WriteString(w, `{"error":0,"msg":"","data":{}}`)
+		if r.URL.Path == "/v2/device/thing" {
+			io.WriteString(w, `{"error":0,"data":{"thingList":[{"itemType":1,"itemData":{"deviceid":"id","params":{"switch":"off"}}}]}}`)
+			return
+		}
+		io.WriteString(w, `{"error":0,"data":{}}`)
 	}))
 	defer server.Close()
 	newProductionClient := func() *Client {
@@ -555,8 +656,8 @@ func TestClientLimitDefaultGateIsProcessWide(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	err := newProductionClient().SetSwitch(ctx, "as", "token", "id", "off")
-	if !errors.Is(err, context.DeadlineExceeded) || requests.Load() != 1 {
-		t.Fatalf("second SetSwitch() = %v, requests = %d; want deadline, 1 request", err, requests.Load())
+	if !errors.Is(err, context.DeadlineExceeded) || requests.Load() != 2 {
+		t.Fatalf("second SetSwitch() = %v, requests = %d; want deadline after initial read and write", err, requests.Load())
 	}
 }
 

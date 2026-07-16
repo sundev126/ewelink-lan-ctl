@@ -43,6 +43,17 @@ type switchEntry struct {
 	Switch any  `json:"switch"`
 }
 
+type scalarSwitchParams struct {
+	Switch string `json:"switch"`
+}
+
+type outletSwitchParams struct {
+	Switches []struct {
+		Outlet int    `json:"outlet"`
+		Switch string `json:"switch"`
+	} `json:"switches"`
+}
+
 func (c *Client) ListDevices(ctx context.Context, region, token string) ([]Device, error) {
 	families, err := c.listFamilies(ctx, region, token)
 	if err != nil {
@@ -150,15 +161,32 @@ func (c *Client) SetSwitch(ctx context.Context, region, token, deviceID, state s
 	if state != "on" && state != "off" {
 		return fmt.Errorf("invalid switch state %q: must be on or off", state)
 	}
-	body, err := json.Marshal(struct {
-		Type   int    `json:"type"`
-		ID     string `json:"id"`
-		Params struct {
+	item, _, mode, err := c.getThing(ctx, region, token, deviceID)
+	if err != nil {
+		return err
+	}
+	var body []byte
+	switch mode {
+	case switchModeScalar:
+		body, err = json.Marshal(struct {
+			Type   int                `json:"type"`
+			ID     string             `json:"id"`
+			Params scalarSwitchParams `json:"params"`
+		}{Type: item.ItemType, ID: deviceID, Params: scalarSwitchParams{Switch: state}})
+	case switchModeOutletZero:
+		params := outletSwitchParams{Switches: make([]struct {
+			Outlet int    `json:"outlet"`
 			Switch string `json:"switch"`
-		} `json:"params"`
-	}{Type: 1, ID: deviceID, Params: struct {
-		Switch string `json:"switch"`
-	}{Switch: state}})
+		}, 1)}
+		params.Switches[0].Switch = state
+		body, err = json.Marshal(struct {
+			Type   int                `json:"type"`
+			ID     string             `json:"id"`
+			Params outletSwitchParams `json:"params"`
+		}{Type: item.ItemType, ID: deviceID, Params: params})
+	default:
+		return fmt.Errorf("unsupported switch mode %d", mode)
+	}
 	if err != nil {
 		return fmt.Errorf("encode switch control: %w", err)
 	}

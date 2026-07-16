@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -193,6 +196,109 @@ func TestGatewayRefreshesAfterTokenErrorAndRetriesOnce(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestGatewaySetSwitchRetriesWholeProtocolAwareOperation(t *testing.T) {
+	tests := []struct {
+		name       string
+		firstError string
+		retryFails bool
+		wantCode   int
+		wantPaths  []string
+		wantTokens []string
+	}{
+		{
+			name:       "metadata read 401 then succeeds",
+			firstError: "read",
+			wantPaths:  []string{"/v2/device/thing", "/v2/device/thing", "/v2/device/thing/status"},
+			wantTokens: []string{"Bearer expired-token", "Bearer fresh-token", "Bearer fresh-token"},
+		},
+		{
+			name:       "status write 402 then re-reads and succeeds",
+			firstError: "write",
+			wantPaths:  []string{"/v2/device/thing", "/v2/device/thing/status", "/v2/device/thing", "/v2/device/thing/status"},
+			wantTokens: []string{"Bearer expired-token", "Bearer expired-token", "Bearer fresh-token", "Bearer fresh-token"},
+		},
+		{
+			name:       "metadata read second token error is returned",
+			firstError: "read",
+			retryFails: true,
+			wantCode:   402,
+			wantPaths:  []string{"/v2/device/thing", "/v2/device/thing"},
+			wantTokens: []string{"Bearer expired-token", "Bearer fresh-token"},
+		},
+		{
+			name:       "status write second token error is returned after re-read",
+			firstError: "write",
+			retryFails: true,
+			wantCode:   401,
+			wantPaths:  []string{"/v2/device/thing", "/v2/device/thing/status", "/v2/device/thing", "/v2/device/thing/status"},
+			wantTokens: []string{"Bearer expired-token", "Bearer expired-token", "Bearer fresh-token", "Bearer fresh-token"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var paths []string
+			var authorizations []string
+			readCalls := 0
+			writeCalls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				authorizations = append(authorizations, r.Header.Get("Authorization"))
+				switch r.URL.Path {
+				case "/v2/device/thing":
+					readCalls++
+					if tt.firstError == "read" && readCalls == 1 {
+						io.WriteString(w, `{"error":401,"msg":"expired","data":{}}`)
+						return
+					}
+					if tt.firstError == "read" && tt.retryFails && readCalls == 2 {
+						io.WriteString(w, `{"error":402,"msg":"invalid","data":{}}`)
+						return
+					}
+					io.WriteString(w, `{"error":0,"data":{"thingList":[{"itemType":1,"itemData":{"deviceid":"device-1","params":{"switches":[{"outlet":0,"switch":"off"}]}}}]}}`)
+				case "/v2/device/thing/status":
+					writeCalls++
+					if tt.firstError == "write" && writeCalls == 1 {
+						io.WriteString(w, `{"error":402,"msg":"expired","data":{}}`)
+						return
+					}
+					if tt.firstError == "write" && tt.retryFails && writeCalls == 2 {
+						io.WriteString(w, `{"error":401,"msg":"invalid","data":{}}`)
+						return
+					}
+					io.WriteString(w, `{"error":0,"data":{}}`)
+				default:
+					t.Fatalf("unexpected request path %q", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			tokens := &gatewayTokenProvider{accessResults: []gatewayAccessResult{
+				{region: "as", token: "expired-token"},
+				{region: "as", token: "fresh-token"},
+			}}
+			gateway := &Gateway{Tokens: tokens, Client: testBearerClient(server.URL, time.Nanosecond)}
+			err := gateway.SetSwitch(context.Background(), "device-1", "on")
+			if tt.retryFails {
+				var upstream *UpstreamError
+				if !errors.As(err, &upstream) || upstream.Code != tt.wantCode {
+					t.Fatalf("SetSwitch() error = %T %v, want second token error code %d", err, err, tt.wantCode)
+				}
+			} else if err != nil {
+				t.Fatalf("SetSwitch() error = %v", err)
+			}
+			if tokens.accessCalls != 2 || tokens.refreshCalls != 1 {
+				t.Fatalf("token calls = access %d, refresh %d; want 2, 1", tokens.accessCalls, tokens.refreshCalls)
+			}
+			if !reflect.DeepEqual(paths, tt.wantPaths) {
+				t.Fatalf("request paths = %#v, want %#v", paths, tt.wantPaths)
+			}
+			if !reflect.DeepEqual(authorizations, tt.wantTokens) {
+				t.Fatalf("request tokens = %#v, want %#v", authorizations, tt.wantTokens)
+			}
+		})
 	}
 }
 
