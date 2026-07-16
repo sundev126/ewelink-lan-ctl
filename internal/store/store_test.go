@@ -107,6 +107,20 @@ func TestFileLoadRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestFileLoadDoesNotClassifyReadFailureAsMalformedJSON(t *testing.T) {
+	_, err := (File{Path: t.TempDir()}).Load()
+	if err == nil {
+		t.Fatal("Load() error = nil, want state-file read failure")
+	}
+	if errors.Is(err, ErrMalformedCredentials) {
+		t.Fatalf("Load() error = %v, do not want ErrMalformedCredentials", err)
+	}
+	var pathError *os.PathError
+	if !errors.As(err, &pathError) {
+		t.Fatalf("Load() error = %T %v, want wrapped *os.PathError", err, err)
+	}
+}
+
 func TestFileLoadRejectsTrailingGarbage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	if err := os.WriteFile(path, []byte(`{"region":"cn"} trailing`), 0o600); err != nil {

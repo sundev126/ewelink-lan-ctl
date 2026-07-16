@@ -308,7 +308,7 @@ func needsRefresh(credentials store.Credentials, now time.Time, ahead time.Durat
 func validate(credentials store.Credentials) error {
 	if credentials.Region == "" || credentials.AccessToken == "" || credentials.RefreshToken == "" ||
 		credentials.AccessTokenExpiresAt.IsZero() || credentials.RefreshTokenExpiresAt.IsZero() {
-		return errors.New("malformed credentials")
+		return store.ErrMalformedCredentials
 	}
 	return nil
 }

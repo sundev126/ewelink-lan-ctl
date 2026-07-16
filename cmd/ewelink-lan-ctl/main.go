@@ -21,18 +21,40 @@ import (
 
 const shutdownTimeout = 10 * time.Second
 
+var (
+	errConfiguration = errors.New("configuration failure")
+	errConstruction  = errors.New("service construction failure")
+	errServe         = errors.New("HTTP listen or serve failure")
+	errShutdown      = errors.New("HTTP shutdown failure")
+)
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	if err := run(logger); err != nil {
-		logger.Error("service stopped", "category", "fatal")
+		logger.Error("service stopped", "category", runErrorLogCategory(err))
 		os.Exit(1)
+	}
+}
+
+func runErrorLogCategory(err error) string {
+	switch {
+	case errors.Is(err, errConfiguration):
+		return "configuration"
+	case errors.Is(err, errConstruction):
+		return "construction"
+	case errors.Is(err, errServe):
+		return "listen_serve"
+	case errors.Is(err, errShutdown):
+		return "shutdown"
+	default:
+		return "unknown"
 	}
 }
 
 func run(logger *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
-		return fmt.Errorf("load configuration: %w", err)
+		return fmt.Errorf("%w: %w", errConfiguration, err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -41,7 +63,7 @@ func run(logger *slog.Logger) error {
 	httpClient := newHTTPClient(cfg)
 	handler, manager, err := buildHandler(cfg, httpClient, logger)
 	if err != nil {
-		return fmt.Errorf("build service: %w", err)
+		return fmt.Errorf("%w: %w", errConstruction, err)
 	}
 	go manager.Run(ctx, cfg.CheckInterval)
 
@@ -73,9 +95,7 @@ func buildHandler(cfg config.Config, httpClient *http.Client, logger *slog.Logge
 		HTTPClient:  httpClient,
 	})
 	manager := token.New(state.Load, state.Save, refreshWith(client), time.Now, cfg.RefreshAhead)
-	if err := manager.Load(context.Background()); err != nil {
-		logger.Error("credentials unavailable", "category", "invalid_state")
-	}
+	logCredentialLoad(context.Background(), manager, logger)
 	gateway := &ewelink.Gateway{Tokens: manager, Client: client}
 	handler := httpapi.New(httpapi.Config{
 		Gateway: gateway,
@@ -84,6 +104,36 @@ func buildHandler(cfg config.Config, httpClient *http.Client, logger *slog.Logge
 		Logger:  logger,
 	})
 	return handler, manager, nil
+}
+
+type credentialLoader interface {
+	Load(context.Context) error
+	Health() bool
+}
+
+func logCredentialLoad(ctx context.Context, loader credentialLoader, logger *slog.Logger) {
+	err := loader.Load(ctx)
+	if err == nil {
+		return
+	}
+	if errors.Is(err, store.ErrMalformedCredentials) {
+		logger.Error("stored credentials are malformed", "category", "state_malformed")
+		return
+	}
+	var pathError *os.PathError
+	if errors.As(err, &pathError) {
+		logger.Error("credential state could not be read", "category", "state_io")
+		return
+	}
+	if errors.Is(err, token.ErrOAuthRequired) {
+		logger.Warn("OAuth authorization is required", "category", "oauth_required")
+		return
+	}
+	if loader.Health() {
+		logger.Warn("startup token refresh deferred", "category", "startup_refresh_transient")
+		return
+	}
+	logger.Warn("startup token refresh failed", "category", "startup_refresh_transient")
 }
 
 type refreshClient interface {
@@ -127,21 +177,21 @@ func serveWith(ctx context.Context, server *http.Server, serveFn func() error) e
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("%w: %w", errServe, err)
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("shut down HTTP server: %w", err)
+			return fmt.Errorf("%w: %w", errShutdown, err)
 		}
 		select {
 		case err := <-serveResult:
 			if errors.Is(err, http.ErrServerClosed) {
 				return nil
 			}
-			return err
+			return fmt.Errorf("%w: %w", errServe, err)
 		case <-shutdownCtx.Done():
-			return fmt.Errorf("wait for HTTP server shutdown: %w", shutdownCtx.Err())
+			return fmt.Errorf("%w: %w", errShutdown, shutdownCtx.Err())
 		}
 	}
 }

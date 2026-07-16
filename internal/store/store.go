@@ -2,12 +2,15 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"time"
 )
+
+var ErrMalformedCredentials = errors.New("malformed credentials")
 
 type Credentials struct {
 	Region                string    `json:"region"`
@@ -31,18 +34,36 @@ func (f File) Load() (Credentials, error) {
 	decoder := json.NewDecoder(file)
 	var credentials Credentials
 	if err := decoder.Decode(&credentials); err != nil {
+		if malformedJSONError(err) {
+			return Credentials{}, fmt.Errorf("%w: decode credentials: %w", ErrMalformedCredentials, err)
+		}
 		return Credentials{}, fmt.Errorf("decode credentials: %w", err)
 	}
 	var trailing json.RawMessage
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		if err == nil {
-			return Credentials{}, fmt.Errorf("decode credentials: unexpected trailing JSON value")
+			return Credentials{}, fmt.Errorf("%w: decode credentials: unexpected trailing JSON value", ErrMalformedCredentials)
+		}
+		if malformedJSONError(err) {
+			return Credentials{}, fmt.Errorf("%w: decode credentials trailing data: %w", ErrMalformedCredentials, err)
 		}
 		return Credentials{}, fmt.Errorf("decode credentials trailing data: %w", err)
 	}
 	credentials.AccessTokenExpiresAt = credentials.AccessTokenExpiresAt.UTC()
 	credentials.RefreshTokenExpiresAt = credentials.RefreshTokenExpiresAt.UTC()
 	return credentials, nil
+}
+
+func malformedJSONError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var syntaxError *json.SyntaxError
+	if errors.As(err, &syntaxError) {
+		return true
+	}
+	var typeError *json.UnmarshalTypeError
+	return errors.As(err, &typeError)
 }
 
 func (f File) Save(credentials Credentials) error {
