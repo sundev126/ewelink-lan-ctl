@@ -313,8 +313,12 @@ func TestLoadDuringBlockedSetCannotPublishStaleCredentials(t *testing.T) {
 	newer := namedCredentials("newer", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
 	saveStarted := make(chan struct{})
 	releaseSave := make(chan struct{})
+	loadReturned := make(chan struct{})
 	var saves int
-	m := newTestManager(func() (store.Credentials, error) { return old, nil }, func(store.Credentials) error {
+	m := newTestManager(func() (store.Credentials, error) {
+		close(loadReturned)
+		return old, nil
+	}, func(store.Credentials) error {
 		saves++
 		if saves == 1 {
 			return nil
@@ -330,11 +334,19 @@ func TestLoadDuringBlockedSetCannotPublishStaleCredentials(t *testing.T) {
 	setDone := make(chan error, 1)
 	go func() { setDone <- m.Set(newer) }()
 	<-saveStarted
-	if err := m.Load(context.Background()); err != nil {
-		t.Fatal(err)
+	loadDone := make(chan error, 1)
+	go func() { loadDone <- m.Load(context.Background()) }()
+	<-loadReturned
+	select {
+	case err := <-loadDone:
+		t.Fatalf("Load completed while Set save was blocked: %v", err)
+	default:
 	}
 	close(releaseSave)
 	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-loadDone; err != nil {
 		t.Fatal(err)
 	}
 	region, token, err := m.Access(context.Background())
@@ -434,6 +446,294 @@ func TestBlockedRefreshWaitersShareErrorAndCanceledWaiterCanLeave(t *testing.T) 
 	}
 }
 
+func TestConcurrentSetsPublishInSaveOrder(t *testing.T) {
+	first := namedCredentials("first", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	second := namedCredentials("second", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	firstSaveStarted := make(chan struct{})
+	releaseFirstSave := make(chan struct{})
+	secondInvoked := make(chan struct{})
+	secondSaveStarted := make(chan struct{})
+	secondSawFirst := make(chan bool, 1)
+	var m *Manager
+	m = newTestManager(nil, func(got store.Credentials) error {
+		switch got {
+		case first:
+			close(firstSaveStarted)
+			<-releaseFirstSave
+		case second:
+			close(secondSaveStarted)
+			secondSawFirst <- m.current() == first
+		}
+		return nil
+	}, nil, func() time.Time { return testNow })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- m.Set(first) }()
+	<-firstSaveStarted
+	secondDone := make(chan error, 1)
+	go func() { close(secondInvoked); secondDone <- m.Set(second) }()
+	<-secondInvoked
+	select {
+	case <-secondSaveStarted:
+		t.Fatal("second Set save entered while first Set save was blocked")
+	default:
+	}
+	close(releaseFirstSave)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if !<-secondSawFirst {
+		t.Fatal("second Set began saving before first Set was published")
+	}
+	if got := m.current(); got != second {
+		t.Fatalf("current credentials = %#v, want second Set", got)
+	}
+}
+
+func TestFailedConcurrentLaterSetLeavesEarlierSetPublished(t *testing.T) {
+	first := namedCredentials("first", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	second := namedCredentials("second", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	wantErr := errors.New("save second")
+	firstSaveStarted := make(chan struct{})
+	releaseFirstSave := make(chan struct{})
+	secondInvoked := make(chan struct{})
+	secondSaveStarted := make(chan struct{})
+	var durable []store.Credentials
+	var durableMu sync.Mutex
+	m := newTestManager(nil, func(got store.Credentials) error {
+		if got == first {
+			close(firstSaveStarted)
+			<-releaseFirstSave
+			durableMu.Lock()
+			durable = append(durable, got)
+			durableMu.Unlock()
+			return nil
+		}
+		close(secondSaveStarted)
+		return wantErr
+	}, nil, func() time.Time { return testNow })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- m.Set(first) }()
+	<-firstSaveStarted
+	secondDone := make(chan error, 1)
+	go func() { close(secondInvoked); secondDone <- m.Set(second) }()
+	<-secondInvoked
+	select {
+	case <-secondSaveStarted:
+		t.Fatal("failed second Set save entered while first Set save was blocked")
+	default:
+	}
+	close(releaseFirstSave)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; !errors.Is(err, wantErr) {
+		t.Fatalf("second Set error = %v, want %v", err, wantErr)
+	}
+	if got := m.current(); got != first {
+		t.Fatalf("current credentials = %#v, want first Set", got)
+	}
+	durableMu.Lock()
+	defer durableMu.Unlock()
+	if len(durable) != 1 || durable[0] != first {
+		t.Fatalf("durable credentials = %#v, want first Set only", durable)
+	}
+}
+
+func TestRefreshResponseWaitsBehindBlockedSetSaveAndBecomesSuperseded(t *testing.T) {
+	old := namedCredentials("old", testNow.Add(time.Minute), testNow.Add(30*24*time.Hour))
+	newer := namedCredentials("newer", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	staleRefresh := namedCredentials("stale-refresh", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	setSaveStarted := make(chan struct{})
+	releaseSetSave := make(chan struct{})
+	refreshReturned := make(chan struct{})
+	var saved []store.Credentials
+	var saveMu sync.Mutex
+	m := newTestManager(nil, func(got store.Credentials) error {
+		if got == newer {
+			close(setSaveStarted)
+			<-releaseSetSave
+		}
+		saveMu.Lock()
+		saved = append(saved, got)
+		saveMu.Unlock()
+		return nil
+	}, func(context.Context, store.Credentials) (store.Credentials, error) {
+		close(refreshReturned)
+		return staleRefresh, nil
+	}, func() time.Time { return testNow })
+	if err := m.Set(old); err != nil {
+		t.Fatal(err)
+	}
+	setDone := make(chan error, 1)
+	go func() { setDone <- m.Set(newer) }()
+	<-setSaveStarted
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- m.ForceRefresh(context.Background()) }()
+	<-refreshReturned
+	select {
+	case err := <-refreshDone:
+		t.Fatalf("refresh completed while Set save was blocked: %v", err)
+	default:
+	}
+	close(releaseSetSave)
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+	saveMu.Lock()
+	defer saveMu.Unlock()
+	if len(saved) != 2 || saved[0] != old || saved[1] != newer {
+		t.Fatalf("saves = %#v, want old then newer", saved)
+	}
+}
+
+func TestSetWaitsBehindBlockedRefreshSave(t *testing.T) {
+	old := namedCredentials("old", testNow.Add(time.Minute), testNow.Add(30*24*time.Hour))
+	fresh := namedCredentials("fresh", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	newer := namedCredentials("newer", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	refreshSaveStarted := make(chan struct{})
+	releaseRefreshSave := make(chan struct{})
+	setInvoked := make(chan struct{})
+	setSaveStarted := make(chan struct{})
+	setSawFresh := make(chan bool, 1)
+	var m *Manager
+	m = newTestManager(nil, func(got store.Credentials) error {
+		switch got {
+		case fresh:
+			close(refreshSaveStarted)
+			<-releaseRefreshSave
+		case newer:
+			setSawFresh <- m.current() == fresh
+			close(setSaveStarted)
+		}
+		return nil
+	}, func(context.Context, store.Credentials) (store.Credentials, error) { return fresh, nil }, func() time.Time { return testNow })
+	if err := m.Set(old); err != nil {
+		t.Fatal(err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- m.ForceRefresh(context.Background()) }()
+	<-refreshSaveStarted
+	setDone := make(chan error, 1)
+	go func() { close(setInvoked); setDone <- m.Set(newer) }()
+	<-setInvoked
+	select {
+	case <-setSaveStarted:
+		t.Fatal("Set save started while refresh save was blocked")
+	default:
+	}
+	close(releaseRefreshSave)
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	if !<-setSawFresh {
+		t.Fatal("Set save began before refreshed credentials were published")
+	}
+}
+
+func TestSetGenerationChangesOnlyAfterSuccessfulSave(t *testing.T) {
+	newer := namedCredentials("newer", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	saveStarted := make(chan struct{})
+	releaseSave := make(chan struct{})
+	m := newTestManager(nil, func(store.Credentials) error {
+		close(saveStarted)
+		<-releaseSave
+		return nil
+	}, nil, func() time.Time { return testNow })
+	before := m.currentGeneration()
+	done := make(chan error, 1)
+	go func() { done <- m.Set(newer) }()
+	<-saveStarted
+	if got := m.currentGeneration(); got != before {
+		t.Fatalf("generation changed during save: got %d, want %d", got, before)
+	}
+	close(releaseSave)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := m.currentGeneration(); got != before+1 {
+		t.Fatalf("generation after save = %d, want %d", got, before+1)
+	}
+}
+
+func TestSetSupersedingRefreshNeverAllowsTwoActiveRefreshes(t *testing.T) {
+	old := namedCredentials("old", testNow.Add(time.Minute), testNow.Add(30*24*time.Hour))
+	newer := namedCredentials("newer", testNow.Add(time.Minute), testNow.Add(30*24*time.Hour))
+	staleFresh := namedCredentials("stale-fresh", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	newFresh := namedCredentials("new-fresh", testNow.Add(30*24*time.Hour), testNow.Add(60*24*time.Hour))
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var calls atomic.Int32
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	m := newTestManager(nil, nil, func(context.Context, store.Credentials) (store.Credentials, error) {
+		call := calls.Add(1)
+		current := active.Add(1)
+		for {
+			maximum := maxActive.Load()
+			if current <= maximum || maxActive.CompareAndSwap(maximum, current) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		if call == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			return staleFresh, nil
+		}
+		close(secondStarted)
+		return newFresh, nil
+	}, func() time.Time { return testNow })
+	if err := m.Set(old); err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- m.ForceRefresh(context.Background()) }()
+	<-firstStarted
+	if err := m.Set(newer); err != nil {
+		t.Fatal(err)
+	}
+	accessDone := make(chan error, 1)
+	go func() {
+		_, token, err := m.Access(context.Background())
+		if err == nil && token != newFresh.AccessToken {
+			err = fmt.Errorf("access token = %q, want %q", token, newFresh.AccessToken)
+		}
+		accessDone <- err
+	}()
+	waitForRefreshWaiters(t, m, 1)
+	select {
+	case <-secondStarted:
+		t.Fatal("second refresh started before first refresh finished")
+	default:
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	<-secondStarted
+	if err := <-accessDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := maxActive.Load(); got != 1 {
+		t.Fatalf("maximum active refreshes = %d, want 1", got)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("refresh calls = %d, want 2 sequential calls", got)
+	}
+}
+
 func TestHealthReportsExpiredAccessAsRefreshable(t *testing.T) {
 	old := credentials(testNow.Add(-time.Minute), testNow.Add(24*time.Hour))
 	m := newTestManager(nil, nil, nil, func() time.Time { return testNow })
@@ -474,6 +774,12 @@ func (m *Manager) setCurrentForTest(credentials store.Credentials) {
 	m.credentials = credentials
 	m.hasCredentials = true
 	m.mu.Unlock()
+}
+
+func (m *Manager) currentGeneration() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.generation
 }
 
 func namedCredentials(name string, accessExpiry, refreshExpiry time.Time) store.Credentials {

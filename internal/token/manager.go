@@ -22,6 +22,7 @@ type RefreshFunc func(context.Context, store.Credentials) (store.Credentials, er
 type refreshCall struct {
 	done       chan struct{}
 	err        error
+	applied    bool
 	waiters    int
 	generation uint64
 }
@@ -37,17 +38,16 @@ type Manager struct {
 	credentials    store.Credentials
 	hasCredentials bool
 	generation     uint64
-	pendingSet     uint64
 	inFlight       *refreshCall
-	commitGate     chan struct{}
+	mutationGate   chan struct{}
 }
 
 func New(load func() (store.Credentials, error), save func(store.Credentials) error, refresh RefreshFunc, now func() time.Time, refreshAhead time.Duration) *Manager {
 	manager := &Manager{
 		load: load, save: save, refresh: refresh, now: now, refreshAhead: refreshAhead,
-		commitGate: make(chan struct{}, 1),
+		mutationGate: make(chan struct{}, 1),
 	}
-	manager.commitGate <- struct{}{}
+	manager.mutationGate <- struct{}{}
 	return manager
 }
 
@@ -58,36 +58,38 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
 	generation := m.generation
 	m.mu.Unlock()
+
 	credentials, err := m.load()
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			m.mu.Lock()
-			if m.generation == generation && m.pendingSet == 0 {
-				m.credentials = store.Credentials{}
-				m.hasCredentials = false
-				m.generation++
-			}
-			m.mu.Unlock()
-			return nil
+	missing := errors.Is(err, os.ErrNotExist)
+	if err != nil && !missing {
+		return fmt.Errorf("load credentials: %w", err)
+	}
+	if !missing {
+		if err := validate(credentials); err != nil {
+			return fmt.Errorf("load credentials: %w", err)
 		}
-		return fmt.Errorf("load credentials: %w", err)
 	}
-	if err := validate(credentials); err != nil {
-		return fmt.Errorf("load credentials: %w", err)
-	}
+
+	<-m.mutationGate
 	m.mu.Lock()
-	published := m.generation == generation && m.pendingSet == 0
+	published := m.generation == generation
 	if published {
-		m.credentials = credentials
-		m.hasCredentials = true
+		if missing {
+			m.credentials = store.Credentials{}
+			m.hasCredentials = false
+		} else {
+			m.credentials = credentials
+			m.hasCredentials = true
+		}
 		m.generation++
 	}
 	m.mu.Unlock()
-	if !published {
+	m.mutationGate <- struct{}{}
+	if !published || missing {
 		return nil
 	}
 	if needsRefresh(credentials, m.now(), m.refreshAhead) {
-		return m.refreshCredentials(ctx, m.refreshAhead, false)
+		return m.ensureRefresh(ctx, m.refreshAhead, false)
 	}
 	return nil
 }
@@ -99,65 +101,63 @@ func (m *Manager) Set(credentials store.Credentials) error {
 	if m.save == nil {
 		return fmt.Errorf("save credentials: callback is nil")
 	}
-	m.mu.Lock()
-	m.generation++
-	generation := m.generation
-	m.pendingSet = generation
-	m.mu.Unlock()
-
-	<-m.commitGate
-	m.mu.Lock()
-	current := m.generation == generation
-	m.mu.Unlock()
-	if !current {
-		m.commitGate <- struct{}{}
-		return nil
-	}
-	err := m.save(credentials)
-	m.mu.Lock()
-	if m.generation == generation {
-		if err == nil {
-			m.credentials = credentials
-			m.hasCredentials = true
-			m.inFlight = nil
-		}
-		m.pendingSet = 0
-		m.generation++
-	}
-	m.mu.Unlock()
-	m.commitGate <- struct{}{}
-	if err != nil {
+	<-m.mutationGate
+	if err := m.save(credentials); err != nil {
+		m.mutationGate <- struct{}{}
 		return fmt.Errorf("save credentials: %w", err)
 	}
+	m.mu.Lock()
+	m.credentials = credentials
+	m.hasCredentials = true
+	m.generation++
+	m.mu.Unlock()
+	m.mutationGate <- struct{}{}
 	return nil
 }
 
 func (m *Manager) Access(ctx context.Context) (region, token string, err error) {
-	credentials, ok, generation := m.snapshotVersion()
-	if !ok {
-		return "", "", ErrOAuthRequired
-	}
-	if !m.now().Before(credentials.RefreshTokenExpiresAt) {
-		m.markOAuthRequired(generation)
-		return "", "", ErrOAuthRequired
-	}
-	if needsRefresh(credentials, m.now(), accessSafetyWindow) {
-		if err := m.refreshCredentials(ctx, accessSafetyWindow, false); err != nil {
-			return "", "", err
-		}
-		credentials, ok = m.snapshot()
+	for {
+		credentials, ok, generation := m.snapshotVersion()
 		if !ok {
 			return "", "", ErrOAuthRequired
 		}
+		if !m.now().Before(credentials.RefreshTokenExpiresAt) {
+			if !m.markOAuthRequired(generation) {
+				continue
+			}
+			return "", "", ErrOAuthRequired
+		}
+		if !needsRefresh(credentials, m.now(), accessSafetyWindow) {
+			return credentials.Region, credentials.AccessToken, nil
+		}
+		applied, err := m.refreshCredentials(ctx, accessSafetyWindow, false)
+		if err != nil {
+			return "", "", err
+		}
+		if !applied {
+			continue
+		}
 	}
-	return credentials.Region, credentials.AccessToken, nil
 }
 
 func (m *Manager) ForceRefresh(ctx context.Context) error {
-	return m.refreshCredentials(ctx, 0, true)
+	applied, err := m.refreshCredentials(ctx, 0, true)
+	if err != nil || applied {
+		return err
+	}
+	return m.ensureRefresh(ctx, accessSafetyWindow, false)
 }
 
-func (m *Manager) refreshCredentials(ctx context.Context, ahead time.Duration, force bool) error {
+func (m *Manager) ensureRefresh(ctx context.Context, ahead time.Duration, force bool) error {
+	for {
+		applied, err := m.refreshCredentials(ctx, ahead, force)
+		if err != nil || applied {
+			return err
+		}
+	}
+}
+
+func (m *Manager) refreshCredentials(ctx context.Context, ahead time.Duration, force bool) (bool, error) {
 	m.mu.Lock()
 	if m.inFlight != nil {
 		call := m.inFlight
@@ -166,44 +166,90 @@ func (m *Manager) refreshCredentials(ctx context.Context, ahead time.Duration, f
 		select {
 		case <-call.done:
 			m.waiterDone(call)
-			return call.err
+			return call.applied, call.err
 		case <-ctx.Done():
 			m.waiterDone(call)
-			return ctx.Err()
+			return false, ctx.Err()
 		}
 	}
 	if !m.hasCredentials {
 		m.mu.Unlock()
-		return ErrOAuthRequired
+		return true, ErrOAuthRequired
 	}
 	credentials := m.credentials
+	generation := m.generation
 	if !force && !needsRefresh(credentials, m.now(), ahead) {
 		m.mu.Unlock()
-		return nil
+		return true, nil
 	}
 	if !m.now().Before(credentials.RefreshTokenExpiresAt) {
-		m.hasCredentials = false
-		m.generation++
 		m.mu.Unlock()
-		return ErrOAuthRequired
+		if !m.markOAuthRequired(generation) {
+			return false, nil
+		}
+		return true, ErrOAuthRequired
 	}
-	call := &refreshCall{done: make(chan struct{}), generation: m.generation}
+	if m.refresh == nil {
+		m.mu.Unlock()
+		return true, fmt.Errorf("refresh credentials: callback is nil")
+	}
+	call := &refreshCall{done: make(chan struct{}), generation: generation}
 	m.inFlight = call
 	m.mu.Unlock()
 
-	err := m.performRefresh(ctx, credentials, call.generation)
+	fresh, refreshErr := m.refresh(ctx, credentials)
+	applied, err := m.commitRefresh(call.generation, fresh, refreshErr)
 	m.mu.Lock()
-	if errors.Is(err, ErrOAuthRequired) && m.generation == call.generation {
-		m.hasCredentials = false
-		m.generation++
-	}
+	call.applied = applied
 	call.err = err
 	if m.inFlight == call {
 		m.inFlight = nil
 	}
 	close(call.done)
 	m.mu.Unlock()
-	return err
+	return applied, err
+}
+
+func (m *Manager) commitRefresh(generation uint64, fresh store.Credentials, refreshErr error) (bool, error) {
+	<-m.mutationGate
+	defer func() { m.mutationGate <- struct{}{} }()
+	m.mu.Lock()
+	current := m.generation == generation
+	m.mu.Unlock()
+	if !current {
+		return false, nil
+	}
+	if refreshErr != nil {
+		err := fmt.Errorf("refresh credentials: %w", refreshErr)
+		if errors.Is(refreshErr, ErrOAuthRequired) {
+			m.mu.Lock()
+			if m.generation == generation {
+				m.hasCredentials = false
+				m.generation++
+			}
+			m.mu.Unlock()
+		}
+		return true, err
+	}
+	if err := validate(fresh); err != nil {
+		return true, fmt.Errorf("refresh credentials: %w", err)
+	}
+	if m.save == nil {
+		return true, fmt.Errorf("save refreshed credentials: callback is nil")
+	}
+	if err := m.save(fresh); err != nil {
+		return true, fmt.Errorf("save refreshed credentials: %w", err)
+	}
+	m.mu.Lock()
+	if m.generation != generation {
+		m.mu.Unlock()
+		return false, nil
+	}
+	m.credentials = fresh
+	m.hasCredentials = true
+	m.generation++
+	m.mu.Unlock()
+	return true, nil
 }
 
 func (m *Manager) waiterDone(call *refreshCall) {
@@ -212,48 +258,17 @@ func (m *Manager) waiterDone(call *refreshCall) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) markOAuthRequired(generation uint64) {
+func (m *Manager) markOAuthRequired(generation uint64) bool {
+	<-m.mutationGate
+	defer func() { m.mutationGate <- struct{}{} }()
 	m.mu.Lock()
-	if m.generation == generation {
-		m.hasCredentials = false
-		m.generation++
+	defer m.mu.Unlock()
+	if m.generation != generation {
+		return false
 	}
-	m.mu.Unlock()
-}
-
-func (m *Manager) performRefresh(ctx context.Context, credentials store.Credentials, generation uint64) error {
-	if m.refresh == nil {
-		return fmt.Errorf("refresh credentials: callback is nil")
-	}
-	fresh, err := m.refresh(ctx, credentials)
-	if err != nil {
-		return fmt.Errorf("refresh credentials: %w", err)
-	}
-	if err := validate(fresh); err != nil {
-		return fmt.Errorf("refresh credentials: %w", err)
-	}
-	if m.save == nil {
-		return fmt.Errorf("save refreshed credentials: callback is nil")
-	}
-	<-m.commitGate
-	defer func() { m.commitGate <- struct{}{} }()
-	m.mu.Lock()
-	current := m.generation == generation
-	m.mu.Unlock()
-	if !current {
-		return nil
-	}
-	if err := m.save(fresh); err != nil {
-		return fmt.Errorf("save refreshed credentials: %w", err)
-	}
-	m.mu.Lock()
-	if m.generation == generation {
-		m.credentials = fresh
-		m.hasCredentials = true
-		m.generation++
-	}
-	m.mu.Unlock()
-	return nil
+	m.hasCredentials = false
+	m.generation++
+	return true
 }
 
 func (m *Manager) Health() bool {
@@ -281,7 +296,7 @@ func (m *Manager) Run(ctx context.Context, interval time.Duration) {
 func (m *Manager) refreshIfNeeded(ctx context.Context) {
 	credentials, ok := m.snapshot()
 	if ok && needsRefresh(credentials, m.now(), m.refreshAhead) {
-		_ = m.refreshCredentials(ctx, m.refreshAhead, false)
+		_ = m.ensureRefresh(ctx, m.refreshAhead, false)
 	}
 }
 
