@@ -190,17 +190,21 @@ func switchDescriptor(item thing) (Device, switchMode, bool) {
 		}
 		found := false
 		for _, entry := range entries {
-			if entry.Outlet == nil || *entry.Outlet != 0 {
+			if entry.Outlet == nil {
+				return Device{}, 0, false
+			}
+			entryState, valid := entry.Switch.(string)
+			if !valid || (entryState != "on" && entryState != "off") {
+				return Device{}, 0, false
+			}
+			if *entry.Outlet != 0 {
 				continue
 			}
 			if found {
 				return Device{}, 0, false
 			}
 			found = true
-			state, ok = entry.Switch.(string)
-			if !ok || (state != "on" && state != "off") {
-				return Device{}, 0, false
-			}
+			state = entryState
 		}
 		if !found {
 			return Device{}, 0, false
