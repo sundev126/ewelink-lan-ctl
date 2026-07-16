@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -118,24 +117,20 @@ func TestConcurrentAccessSharesRefreshResult(t *testing.T) {
 
 	const count = 16
 	results := make(chan error, count)
-	var ready sync.WaitGroup
-	ready.Add(count)
-	gate := make(chan struct{})
-	for i := 0; i < count; i++ {
-		go func() {
-			ready.Done()
-			<-gate
-			_, token, err := m.Access(context.Background())
-			if err == nil && token != fresh.AccessToken {
-				err = errors.New("caller received stale token")
-			}
-			results <- err
-		}()
+	access := func(ctx context.Context) {
+		_, token, err := m.Access(ctx)
+		if err == nil && token != fresh.AccessToken {
+			err = errors.New("caller received stale token")
+		}
+		results <- err
 	}
-	ready.Wait()
-	close(gate)
+	go access(context.Background())
 	<-started
-	waitForRefreshWaiters(t, m, count-1)
+	for i := 0; i < count-1; i++ {
+		ctx := newObservedContext()
+		go access(ctx)
+		<-ctx.entered
+	}
 	close(release)
 	for i := 0; i < count; i++ {
 		if err := <-results; err != nil {
@@ -422,15 +417,17 @@ func TestBlockedRefreshWaitersShareErrorAndCanceledWaiterCanLeave(t *testing.T) 
 	go func() { _, _, err := m.Access(context.Background()); results <- err }()
 	<-refreshStarted
 	for i := 0; i < waiters; i++ {
-		go func() { _, _, err := m.Access(context.Background()); results <- err }()
+		ctx := newObservedContext()
+		go func() { _, _, err := m.Access(ctx); results <- err }()
+		<-ctx.entered
 	}
-	waitForRefreshWaiters(t, m, waiters)
 
-	canceled, cancel := context.WithCancel(context.Background())
-	cancel()
+	canceled := newObservedContext()
+	canceled.cancel()
 	if _, _, err := m.Access(canceled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled waiter error = %v, want context.Canceled", err)
 	}
+	<-canceled.entered
 	if calls.Load() != 1 {
 		t.Fatalf("refresh calls with canceled waiter = %d, want 1", calls.Load())
 	}
@@ -705,14 +702,15 @@ func TestSetSupersedingRefreshNeverAllowsTwoActiveRefreshes(t *testing.T) {
 		t.Fatal(err)
 	}
 	accessDone := make(chan error, 1)
+	accessCtx := newObservedContext()
 	go func() {
-		_, token, err := m.Access(context.Background())
+		_, token, err := m.Access(accessCtx)
 		if err == nil && token != newFresh.AccessToken {
 			err = fmt.Errorf("access token = %q, want %q", token, newFresh.AccessToken)
 		}
 		accessDone <- err
 	}()
-	waitForRefreshWaiters(t, m, 1)
+	<-accessCtx.entered
 	select {
 	case <-secondStarted:
 		t.Fatal("second refresh started before first refresh finished")
@@ -790,19 +788,35 @@ func namedCredentials(name string, accessExpiry, refreshExpiry time.Time) store.
 	return credentials
 }
 
-func waitForRefreshWaiters(t *testing.T, m *Manager, want int) {
-	t.Helper()
-	for i := 0; i < 10000; i++ {
-		m.mu.Lock()
-		got := 0
-		if m.inFlight != nil {
-			got = m.inFlight.waiters
-		}
-		m.mu.Unlock()
-		if got >= want {
-			return
-		}
-		runtime.Gosched()
+type observedContext struct {
+	context.Context
+	entered  chan struct{}
+	done     chan struct{}
+	once     sync.Once
+	canceled atomic.Bool
+}
+
+func newObservedContext() *observedContext {
+	return &observedContext{
+		Context: context.Background(),
+		entered: make(chan struct{}),
+		done:    make(chan struct{}),
 	}
-	t.Fatalf("in-flight refresh waiters did not reach %d", want)
+}
+
+func (c *observedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.done
+}
+
+func (c *observedContext) Err() error {
+	if c.canceled.Load() {
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
+
+func (c *observedContext) cancel() {
+	c.canceled.Store(true)
+	close(c.done)
 }

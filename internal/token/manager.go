@@ -23,7 +23,6 @@ type refreshCall struct {
 	done       chan struct{}
 	err        error
 	applied    bool
-	waiters    int
 	generation uint64
 }
 
@@ -161,14 +160,11 @@ func (m *Manager) refreshCredentials(ctx context.Context, ahead time.Duration, f
 	m.mu.Lock()
 	if m.inFlight != nil {
 		call := m.inFlight
-		call.waiters++
 		m.mu.Unlock()
 		select {
 		case <-call.done:
-			m.waiterDone(call)
 			return call.applied, call.err
 		case <-ctx.Done():
-			m.waiterDone(call)
 			return false, ctx.Err()
 		}
 	}
@@ -250,12 +246,6 @@ func (m *Manager) commitRefresh(generation uint64, fresh store.Credentials, refr
 	m.generation++
 	m.mu.Unlock()
 	return true, nil
-}
-
-func (m *Manager) waiterDone(call *refreshCall) {
-	m.mu.Lock()
-	call.waiters--
-	m.mu.Unlock()
 }
 
 func (m *Manager) markOAuthRequired(generation uint64) bool {
