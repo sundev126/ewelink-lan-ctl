@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -27,9 +28,17 @@ func (f File) Load() (Credentials, error) {
 	}
 	defer file.Close()
 
+	decoder := json.NewDecoder(file)
 	var credentials Credentials
-	if err := json.NewDecoder(file).Decode(&credentials); err != nil {
+	if err := decoder.Decode(&credentials); err != nil {
 		return Credentials{}, fmt.Errorf("decode credentials: %w", err)
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return Credentials{}, fmt.Errorf("decode credentials: unexpected trailing JSON value")
+		}
+		return Credentials{}, fmt.Errorf("decode credentials trailing data: %w", err)
 	}
 	credentials.AccessTokenExpiresAt = credentials.AccessTokenExpiresAt.UTC()
 	credentials.RefreshTokenExpiresAt = credentials.RefreshTokenExpiresAt.UTC()
@@ -40,6 +49,9 @@ func (f File) Save(credentials Credentials) error {
 	directory := filepath.Dir(f.Path)
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return fmt.Errorf("create credentials directory: %w", err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		return fmt.Errorf("set credentials directory permissions: %w", err)
 	}
 
 	temporary, err := os.CreateTemp(directory, "."+filepath.Base(f.Path)+".tmp-*")

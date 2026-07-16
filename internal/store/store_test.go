@@ -62,7 +62,11 @@ func TestFileSaveUsesUTCTimestamps(t *testing.T) {
 
 func TestFileSaveUsesPrivateModes(t *testing.T) {
 	root := t.TempDir()
-	file := File{Path: filepath.Join(root, "nested", "state.json")}
+	directory := filepath.Join(root, "nested")
+	if err := os.Mkdir(directory, 0o755); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	file := File{Path: filepath.Join(directory, "state.json")}
 
 	if err := file.Save(testCredentials()); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -103,6 +107,17 @@ func TestFileLoadRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestFileLoadRejectsTrailingGarbage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"region":"cn"} trailing`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := (File{Path: path}).Load(); err == nil {
+		t.Fatal("Load() error = nil, want trailing garbage error")
+	}
+}
+
 func TestInterruptedSavePreservesPreviousState(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	file := File{Path: filepath.Join(dir, "state.json")}
@@ -111,12 +126,9 @@ func TestInterruptedSavePreservesPreviousState(t *testing.T) {
 		t.Fatalf("initial Save() error = %v", err)
 	}
 
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatalf("Chmod() error = %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 	updated := previous
 	updated.AccessToken = "replacement-token"
+	updated.AccessTokenExpiresAt = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
 	if err := file.Save(updated); err == nil {
 		t.Fatal("interrupted Save() error = nil, want error")
 	}
