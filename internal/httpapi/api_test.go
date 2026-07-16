@@ -12,18 +12,14 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/zm/ewelink-lan-ctl/internal/ewelink"
 	"github.com/zm/ewelink-lan-ctl/internal/store"
 	"github.com/zm/ewelink-lan-ctl/internal/token"
-)
-
-var (
-	errNotFound    = errors.New("device not found")
-	errUnsupported = errors.New("unsupported device")
-	errOffline     = errors.New("device offline")
 )
 
 type fakeGateway struct {
@@ -74,7 +70,7 @@ type fakeTokens struct {
 func (t *fakeTokens) Health() bool                            { return t.ready }
 func (t *fakeTokens) Set(credentials store.Credentials) error { t.set = credentials; return t.err }
 
-func testHandler(gateway *fakeGateway, tokens *fakeTokens, oauth *fakeOAuth, now func() time.Time, logs io.Writer) http.Handler {
+func testHandler(gateway Gateway, tokens TokenManager, oauth OAuthClient, now func() time.Time, logs io.Writer) http.Handler {
 	if gateway == nil {
 		gateway = &fakeGateway{}
 	}
@@ -91,6 +87,28 @@ func testHandler(gateway *fakeGateway, tokens *fakeTokens, oauth *fakeOAuth, now
 		logs = io.Discard
 	}
 	return New(Config{Gateway: gateway, OAuth: oauth, Tokens: tokens, Now: now, Logger: slog.New(slog.NewTextHandler(logs, nil))})
+}
+
+type concurrentOAuth struct {
+	credentials store.Credentials
+	exchanges   atomic.Int32
+}
+
+func (o *concurrentOAuth) AuthorizationURL(state string) (string, error) {
+	return "https://auth.example/authorize?state=" + url.QueryEscape(state), nil
+}
+
+func (o *concurrentOAuth) ExchangeCode(context.Context, string, string) (store.Credentials, error) {
+	o.exchanges.Add(1)
+	return o.credentials, nil
+}
+
+type concurrentTokens struct{ sets atomic.Int32 }
+
+func (*concurrentTokens) Health() bool { return false }
+func (t *concurrentTokens) Set(store.Credentials) error {
+	t.sets.Add(1)
+	return nil
 }
 
 func request(t *testing.T, handler http.Handler, method, target, body string) *httptest.ResponseRecorder {
@@ -160,13 +178,17 @@ func TestDeviceAndSwitchErrorMappings(t *testing.T) {
 		code, message string
 	}{
 		{"missing oauth", token.ErrOAuthRequired, 503, "oauth_required", "OAuth authorization required"},
-		{"not found", errNotFound, 404, "device_not_found", "device not found"},
-		{"unsupported", errUnsupported, 409, "unsupported_device", "device does not support a single switch"},
-		{"offline", errOffline, 502, "device_offline", "device is offline"},
+		{"not found", ewelink.ErrDeviceNotFound, 404, "device_not_found", "device not found"},
+		{"unsupported", ewelink.ErrUnsupportedDevice, 409, "unsupported_device", "device does not support a single switch"},
+		{"offline", ewelink.ErrDeviceOffline, 502, "device_offline", "device is offline"},
 		{"upstream not found", &ewelink.UpstreamError{HTTPStatus: 200, Code: 404, Message: "device not found"}, 404, "device_not_found", "device not found"},
 		{"upstream http not found", &ewelink.UpstreamError{HTTPStatus: 404, Code: 0, Message: "redacted"}, 404, "device_not_found", "device not found"},
 		{"upstream unsupported", &ewelink.UpstreamError{HTTPStatus: 200, Code: 409, Message: "redacted"}, 409, "unsupported_device", "device does not support a single switch"},
-		{"upstream offline", &ewelink.UpstreamError{HTTPStatus: 200, Code: 400, Message: "device is offline"}, 502, "device_offline", "device is offline"},
+		{"upstream message is not authoritative", &ewelink.UpstreamError{HTTPStatus: 200, Code: 400, Message: "device is offline"}, 502, "ewelink_rejected", "eWeLink rejected request"},
+		{"http 500 overrides not found message", &ewelink.UpstreamError{HTTPStatus: 500, Code: 0, Message: "not found"}, 503, "ewelink_unavailable", "eWeLink service unavailable"},
+		{"http 404 overrides unsupported message", &ewelink.UpstreamError{HTTPStatus: 404, Code: 0, Message: "unsupported device"}, 404, "device_not_found", "device not found"},
+		{"http 409 overrides not found message", &ewelink.UpstreamError{HTTPStatus: 409, Code: 0, Message: "not found"}, 409, "unsupported_device", "device does not support a single switch"},
+		{"free form local error is not classified", errors.New("device not found unsupported offline unavailable"), 502, "ewelink_rejected", "eWeLink rejected request"},
 		{"upstream unavailable", &ewelink.UpstreamError{HTTPStatus: 503, Code: 500, Message: "secret"}, 503, "ewelink_unavailable", "eWeLink service unavailable"},
 		{"upstream code unavailable", &ewelink.UpstreamError{HTTPStatus: 200, Code: 503, Message: "secret"}, 503, "ewelink_unavailable", "eWeLink service unavailable"},
 		{"upstream rejected", &ewelink.UpstreamError{HTTPStatus: 400, Code: 400, Message: "secret"}, 502, "ewelink_rejected", "eWeLink rejected request"},
@@ -193,6 +215,36 @@ func TestSwitchRejectsOversizedBody(t *testing.T) {
 func TestDeviceRoutesRejectRawDotSegmentsWithoutRedirect(t *testing.T) {
 	rec := request(t, testHandler(nil, nil, nil, nil, nil), http.MethodPut, "/api/v1/devices/../switch", `{"state":"on"}`)
 	assertResponse(t, rec, http.StatusBadRequest, "{\"error\":{\"code\":\"invalid_request\",\"message\":\"invalid request\"}}\n")
+}
+
+func TestWrongMethodsReturnStableJSON(t *testing.T) {
+	tests := []struct{ method, path string }{
+		{http.MethodPost, "/healthz"},
+		{http.MethodHead, "/healthz"},
+		{http.MethodPost, "/oauth/start"},
+		{http.MethodHead, "/oauth/start"},
+		{http.MethodPost, "/callback"},
+		{http.MethodHead, "/callback"},
+		{http.MethodPost, "/api/v1/devices"},
+		{http.MethodHead, "/api/v1/devices"},
+		{http.MethodPost, "/api/v1/devices/abc/status"},
+		{http.MethodHead, "/api/v1/devices/abc/status"},
+		{http.MethodPost, "/api/v1/devices/abc/switch"},
+		{http.MethodGet, "/api/v1/devices/abc/switch"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
+			rec := request(t, testHandler(nil, nil, nil, nil, nil), tt.method, tt.path, "")
+			assertResponse(t, rec, http.StatusMethodNotAllowed, "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"}}\n")
+		})
+	}
+}
+
+func TestUnmatchedAPIV1PathReturnsStableJSON(t *testing.T) {
+	for _, path := range []string{"/api/v1", "/api/v1/unknown"} {
+		rec := request(t, testHandler(nil, nil, nil, nil, nil), http.MethodGet, path, "")
+		assertResponse(t, rec, http.StatusNotFound, "{\"error\":{\"code\":\"not_found\",\"message\":\"not found\"}}\n")
+	}
 }
 
 func TestHealthContract(t *testing.T) {
@@ -243,6 +295,40 @@ func TestOAuthStartRedirectsWithUniqueRandomState(t *testing.T) {
 	}
 }
 
+func TestOAuthStartCapturesClockOnce(t *testing.T) {
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	handler := testHandler(nil, nil, &fakeOAuth{}, func() time.Time {
+		calls++
+		return now.Add(time.Duration(calls) * time.Second)
+	}, nil)
+	startOAuth(t, handler)
+	if calls != 1 {
+		t.Fatalf("clock calls = %d, want 1", calls)
+	}
+}
+
+func TestOAuthStartBoundsStateEntriesAndRecoversAfterExpiry(t *testing.T) {
+	const stateCapacity = 1024
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	current := now
+	oauth := &fakeOAuth{}
+	logs := new(bytes.Buffer)
+	handler := testHandler(nil, nil, oauth, func() time.Time { return current }, logs)
+	for range stateCapacity {
+		startOAuth(t, handler)
+	}
+	rec := request(t, handler, http.MethodGet, "/oauth/start", "")
+	assertResponse(t, rec, http.StatusServiceUnavailable, "{\"error\":{\"code\":\"oauth_unavailable\",\"message\":\"authorization temporarily unavailable\"}}\n")
+	for _, state := range oauth.states {
+		if strings.Contains(logs.String(), state) {
+			t.Fatal("OAuth state leaked in capacity log")
+		}
+	}
+	current = now.Add(oauthStateLifetime)
+	startOAuth(t, handler)
+}
+
 func TestOAuthCallbackRejectsMissingUnknownExpiredAndReplayedState(t *testing.T) {
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
 	current := now
@@ -287,6 +373,42 @@ func TestOAuthCallbackConsumesStateBeforeFailedExchange(t *testing.T) {
 	assertResponse(t, second, http.StatusBadRequest, "{\"error\":{\"code\":\"invalid_request\",\"message\":\"invalid OAuth callback\"}}\n")
 	if strings.Contains(first.Body.String()+logs.String(), "secret-code") {
 		t.Fatal("authorization code leaked in body or logs")
+	}
+}
+
+func TestOAuthCallbackConcurrentReplayAllowsExactlyOneExchange(t *testing.T) {
+	now := time.Now()
+	oauth := &concurrentOAuth{credentials: validCredentials(now)}
+	tokens := &concurrentTokens{}
+	handler := testHandler(nil, tokens, oauth, nil, nil)
+	state := startOAuth(t, handler)
+	target := "/callback?region=us&code=authorization-code&state=" + url.QueryEscape(state)
+
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			statuses <- rec.Code
+		}()
+	}
+	ready.Wait()
+	close(start)
+	first, second := <-statuses, <-statuses
+	if !((first == http.StatusOK && second == http.StatusBadRequest) || (first == http.StatusBadRequest && second == http.StatusOK)) {
+		t.Fatalf("callback statuses = (%d, %d), want one 200 and one 400", first, second)
+	}
+	if got := oauth.exchanges.Load(); got != 1 {
+		t.Fatalf("ExchangeCode calls = %d, want 1", got)
+	}
+	if got := tokens.sets.Load(); got != 1 {
+		t.Fatalf("Token Set calls = %d, want 1", got)
 	}
 }
 

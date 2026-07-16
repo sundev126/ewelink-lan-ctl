@@ -5,6 +5,12 @@ import (
 	"fmt"
 )
 
+var (
+	ErrDeviceNotFound    = errors.New("ewelink device not found")
+	ErrUnsupportedDevice = errors.New("ewelink device does not expose a supported switch")
+	ErrDeviceOffline     = errors.New("ewelink device is offline")
+)
+
 type Device struct {
 	DeviceID string `json:"device_id"`
 	Name     string `json:"name"`

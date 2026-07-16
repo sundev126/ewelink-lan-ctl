@@ -99,9 +99,9 @@ func (c *Client) GetDevice(ctx context.Context, region, token, deviceID string) 
 		return device, nil
 	}
 	if matchedUnsupported {
-		return Device{}, fmt.Errorf("ewelink device %q does not expose a scalar on/off switch", deviceID)
+		return Device{}, fmt.Errorf("%w: %q", ErrUnsupportedDevice, deviceID)
 	}
-	return Device{}, fmt.Errorf("get ewelink device %q: matching thing not returned", deviceID)
+	return Device{}, fmt.Errorf("%w: %q", ErrDeviceNotFound, deviceID)
 }
 
 func (c *Client) SetSwitch(ctx context.Context, region, token, deviceID, state string) error {

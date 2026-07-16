@@ -22,6 +22,7 @@ import (
 
 const (
 	oauthStateLifetime = 10 * time.Minute
+	maxOAuthStates     = 1024
 	maxSwitchBodyBytes = 4 << 10
 )
 
@@ -73,12 +74,35 @@ func New(config Config) http.Handler {
 	}
 	a := &api{gateway: config.Gateway, oauth: config.OAuth, tokens: config.Tokens, now: now, logger: logger, states: make(map[string]time.Time)}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", a.health)
-	mux.HandleFunc("GET /oauth/start", a.oauthStart)
-	mux.HandleFunc("GET /callback", a.callback)
-	mux.HandleFunc("GET /api/v1/devices", a.devices)
-	mux.HandleFunc("GET /api/v1/devices/{device_id}/status", a.status)
-	mux.HandleFunc("PUT /api/v1/devices/{device_id}/switch", a.setSwitch)
+	methodNotAllowed := func(w http.ResponseWriter, _ *http.Request) {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+	}
+	exactMethod := func(method string, handler http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != method {
+				methodNotAllowed(w, r)
+				return
+			}
+			handler(w, r)
+		}
+	}
+	mux.HandleFunc("GET /healthz", exactMethod(http.MethodGet, a.health))
+	mux.HandleFunc("GET /oauth/start", exactMethod(http.MethodGet, a.oauthStart))
+	mux.HandleFunc("GET /callback", exactMethod(http.MethodGet, a.callback))
+	mux.HandleFunc("GET /api/v1/devices", exactMethod(http.MethodGet, a.devices))
+	mux.HandleFunc("GET /api/v1/devices/{device_id}/status", exactMethod(http.MethodGet, a.status))
+	mux.HandleFunc("PUT /api/v1/devices/{device_id}/switch", exactMethod(http.MethodPut, a.setSwitch))
+	mux.HandleFunc("/healthz", methodNotAllowed)
+	mux.HandleFunc("/oauth/start", methodNotAllowed)
+	mux.HandleFunc("/callback", methodNotAllowed)
+	mux.HandleFunc("/api/v1/devices", methodNotAllowed)
+	mux.HandleFunc("/api/v1/devices/{device_id}/status", methodNotAllowed)
+	mux.HandleFunc("/api/v1/devices/{device_id}/switch", methodNotAllowed)
+	notFound := func(w http.ResponseWriter, _ *http.Request) {
+		writeAPIError(w, http.StatusNotFound, "not_found", "not found")
+	}
+	mux.HandleFunc("/api/v1", notFound)
+	mux.HandleFunc("/api/v1/", notFound)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if malformedDevicePath(r.URL.Path) {
 			writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid request")
@@ -217,6 +241,15 @@ func classifyOperationError(err error) (int, string, string) {
 	if errors.Is(err, token.ErrOAuthRequired) {
 		return http.StatusServiceUnavailable, "oauth_required", "OAuth authorization required"
 	}
+	if errors.Is(err, ewelink.ErrDeviceNotFound) {
+		return http.StatusNotFound, "device_not_found", "device not found"
+	}
+	if errors.Is(err, ewelink.ErrUnsupportedDevice) {
+		return http.StatusConflict, "unsupported_device", "device does not support a single switch"
+	}
+	if errors.Is(err, ewelink.ErrDeviceOffline) {
+		return http.StatusBadGateway, "device_offline", "device is offline"
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusServiceUnavailable, "ewelink_unavailable", "eWeLink service unavailable"
 	}
@@ -226,34 +259,23 @@ func classifyOperationError(err error) (int, string, string) {
 	}
 	var upstream *ewelink.UpstreamError
 	if errors.As(err, &upstream) {
-		upstreamMessage := strings.ToLower(upstream.Message)
 		switch {
-		case strings.Contains(upstreamMessage, "not found"):
+		case upstream.HTTPStatus == http.StatusNotFound:
 			return http.StatusNotFound, "device_not_found", "device not found"
-		case strings.Contains(upstreamMessage, "offline"):
-			return http.StatusBadGateway, "device_offline", "device is offline"
-		case strings.Contains(upstreamMessage, "unsupported"), strings.Contains(upstreamMessage, "does not expose"), upstream.HTTPStatus == http.StatusConflict, upstream.Code == http.StatusConflict:
+		case upstream.HTTPStatus == http.StatusConflict:
 			return http.StatusConflict, "unsupported_device", "device does not support a single switch"
-		case upstream.HTTPStatus == http.StatusNotFound || upstream.Code == http.StatusNotFound:
+		case upstream.HTTPStatus >= 500:
+			return http.StatusServiceUnavailable, "ewelink_unavailable", "eWeLink service unavailable"
+		case upstream.Code == http.StatusNotFound:
 			return http.StatusNotFound, "device_not_found", "device not found"
-		case upstream.HTTPStatus >= 500 || upstream.Code >= 500:
+		case upstream.Code == http.StatusConflict:
+			return http.StatusConflict, "unsupported_device", "device does not support a single switch"
+		case upstream.Code >= 500:
 			return http.StatusServiceUnavailable, "ewelink_unavailable", "eWeLink service unavailable"
 		}
 		return http.StatusBadGateway, "ewelink_rejected", "eWeLink rejected request"
 	}
-	text := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(text, "not found"), strings.Contains(text, "matching thing not returned"):
-		return http.StatusNotFound, "device_not_found", "device not found"
-	case strings.Contains(text, "unsupported"), strings.Contains(text, "does not expose"):
-		return http.StatusConflict, "unsupported_device", "device does not support a single switch"
-	case strings.Contains(text, "offline"):
-		return http.StatusBadGateway, "device_offline", "device is offline"
-	case strings.Contains(text, "unavailable"):
-		return http.StatusServiceUnavailable, "ewelink_unavailable", "eWeLink service unavailable"
-	default:
-		return http.StatusBadGateway, "ewelink_rejected", "eWeLink rejected request"
-	}
+	return http.StatusBadGateway, "ewelink_rejected", "eWeLink rejected request"
 }
 
 func writeAPIError(w http.ResponseWriter, status int, code, message string) {
@@ -280,6 +302,7 @@ func (a *api) oauthStart(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "internal_error", "could not start authorization")
 		return
 	}
+	now := a.now()
 	state, err := randomState()
 	if err != nil {
 		a.logger.Error("OAuth start failed", "category", "random_state")
@@ -293,8 +316,14 @@ func (a *api) oauthStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.stateMu.Lock()
-	a.removeExpiredStatesLocked(a.now())
-	a.states[state] = a.now().Add(oauthStateLifetime)
+	a.removeExpiredStatesLocked(now)
+	if len(a.states) >= maxOAuthStates {
+		a.stateMu.Unlock()
+		a.logger.Warn("OAuth start unavailable", "category", "state_capacity")
+		writeAPIError(w, http.StatusServiceUnavailable, "oauth_unavailable", "authorization temporarily unavailable")
+		return
+	}
+	a.states[state] = now.Add(oauthStateLifetime)
 	a.stateMu.Unlock()
 	http.Redirect(w, r, authorizationURL, http.StatusFound)
 }

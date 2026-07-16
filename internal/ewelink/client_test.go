@@ -158,6 +158,26 @@ func TestClientGetDeviceScansPastUnsupportedMatchingCandidate(t *testing.T) {
 	}
 }
 
+func TestClientGetDeviceReturnsTypedLocalErrors(t *testing.T) {
+	tests := []struct {
+		name, response string
+		want           error
+	}{
+		{"not found", `{"error":0,"data":{"thingList":[]}}`, ErrDeviceNotFound},
+		{"unsupported", `{"error":0,"data":{"thingList":[{"itemType":1,"itemData":{"deviceid":"device","params":{"switches":[]}}}]}}`, ErrUnsupportedDevice},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, tt.response) }))
+			defer server.Close()
+			_, err := testBearerClient(server.URL, time.Nanosecond).GetDevice(context.Background(), "us", "token", "device")
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("GetDevice() error = %v, want errors.Is(_, %v)", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestClientSetSwitchSendsControlWithoutStatusRead(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
