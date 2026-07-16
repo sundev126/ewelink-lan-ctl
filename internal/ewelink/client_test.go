@@ -2,6 +2,7 @@ package ewelink
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,11 +18,14 @@ func TestClientListDevicesPaginatesAndFiltersUnsupportedThings(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assertBearerHeaders(t, r)
-		if r.Method != http.MethodGet || r.URL.Path != "/v2/device/thing" || r.URL.Query().Get("num") != "30" {
-			t.Errorf("request = %s %s, want GET /v2/device/thing?num=30", r.Method, r.URL.String())
-		}
 		switch requests.Add(1) {
 		case 1:
+			if r.Method != http.MethodGet || r.URL.Path != "/v2/family" {
+				t.Errorf("first request = %s %s, want GET /v2/family", r.Method, r.URL.String())
+			}
+			io.WriteString(w, `{"error":0,"data":{"familyList":[{"id":"family"}]}}`)
+		case 2:
+			assertThingListQuery(t, r, "family", "-9999999")
 			if got := r.URL.Query().Get("beginIndex"); got != "-9999999" {
 				t.Errorf("first beginIndex = %q, want -9999999", got)
 			}
@@ -30,7 +34,8 @@ func TestClientListDevicesPaginatesAndFiltersUnsupportedThings(t *testing.T) {
 				`{"itemType":2,"index":17,"itemData":{"deviceid":"shared","name":"Shared","online":false,"params":{"switch":"off"},"extra":{"uiid":5,"model":"S20"}}},`+
 				`{"itemType":3,"index":42,"itemData":{"id":"group","name":"Group","params":{"switch":"on"}}}`+
 				`]}}`)
-		case 2:
+		case 3:
+			assertThingListQuery(t, r, "family", "42")
 			if got := r.URL.Query().Get("beginIndex"); got != "42" {
 				t.Errorf("second beginIndex = %q, want 42", got)
 			}
@@ -52,12 +57,123 @@ func TestClientListDevicesPaginatesAndFiltersUnsupportedThings(t *testing.T) {
 	want := []Device{
 		{DeviceID: "owned", Name: "Owned", Online: true, State: "on", UIID: 1, Model: "BASIC"},
 		{DeviceID: "shared", Name: "Shared", Online: false, State: "off", UIID: 5, Model: "S20"},
+		{DeviceID: "multi", Name: "Multi", Online: true, State: "on", UIID: 2, Model: "DUAL"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ListDevices() = %#v, want %#v", got, want)
 	}
-	if got := requests.Load(); got != 2 {
-		t.Fatalf("request count = %d, want 2", got)
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("request count = %d, want 3", got)
+	}
+}
+
+func TestClientListDevicesAcrossFamilies(t *testing.T) {
+	t.Run("paginates each family and deduplicates devices", func(t *testing.T) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assertBearerHeaders(t, r)
+			switch requests.Add(1) {
+			case 1:
+				if r.Method != http.MethodGet || r.URL.Path != "/v2/family" {
+					t.Fatalf("first request = %s %s, want GET /v2/family", r.Method, r.URL.String())
+				}
+				io.WriteString(w, `{"error":0,"data":{"familyList":[{"id":"family-a"},{"id":"family-b"}]}}`)
+			case 2:
+				assertThingListQuery(t, r, "family-a", "-9999999")
+				io.WriteString(w, `{"error":0,"data":{"total":2,"thingList":[`+
+					`{"itemType":1,"index":10,"itemData":{"deviceid":"scalar","name":"Scalar","online":true,"params":{"switch":"off"},"extra":{"uiid":1,"model":"BASIC"}}}`+
+					`]}}`)
+			case 3:
+				assertThingListQuery(t, r, "family-a", "10")
+				io.WriteString(w, `{"error":0,"data":{"total":2,"thingList":[`+
+					`{"itemType":1,"index":20,"itemData":{"deviceid":"duplicate","name":"First","online":true,"params":{"switch":"on"},"extra":{"uiid":2,"model":"FIRST"}}}`+
+					`]}}`)
+			case 4:
+				assertThingListQuery(t, r, "family-b", "-9999999")
+				io.WriteString(w, `{"error":0,"data":{"total":2,"thingList":[`+
+					`{"itemType":2,"index":7,"itemData":{"deviceid":"duplicate","name":"Second","online":false,"params":{"switch":"off"},"extra":{"uiid":3,"model":"SECOND"}}},`+
+					`{"itemType":1,"index":8,"itemData":{"deviceid":"array","name":"Array","online":true,"params":{"switches":[{"outlet":0,"switch":"on"}]},"extra":{"uiid":138,"model":"ARRAY"}}}`+
+					`]}}`)
+			default:
+				t.Fatalf("unexpected request %d: %s", requests.Load(), r.URL.String())
+			}
+		}))
+		defer server.Close()
+
+		got, err := testBearerClient(server.URL, time.Nanosecond).ListDevices(context.Background(), "as", "access-token")
+		if err != nil {
+			t.Fatalf("ListDevices() error = %v", err)
+		}
+		want := []Device{
+			{DeviceID: "scalar", Name: "Scalar", Online: true, State: "off", UIID: 1, Model: "BASIC"},
+			{DeviceID: "duplicate", Name: "First", Online: true, State: "on", UIID: 2, Model: "FIRST"},
+			{DeviceID: "array", Name: "Array", Online: true, State: "on", UIID: 138, Model: "ARRAY"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ListDevices() = %#v, want %#v", got, want)
+		}
+		if got := requests.Load(); got != 4 {
+			t.Fatalf("request count = %d, want 4", got)
+		}
+	})
+
+	t.Run("fails when one family thing request fails", func(t *testing.T) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch requests.Add(1) {
+			case 1:
+				io.WriteString(w, `{"error":0,"data":{"familyList":[{"id":"family-a"},{"id":"family-b"}]}}`)
+			case 2:
+				assertThingListQuery(t, r, "family-a", "-9999999")
+				io.WriteString(w, `{"error":0,"data":{"total":0,"thingList":[]}}`)
+			case 3:
+				assertThingListQuery(t, r, "family-b", "-9999999")
+				io.WriteString(w, `{"error":503,"msg":"unavailable","data":{}}`)
+			default:
+				t.Fatalf("unexpected request %d", requests.Load())
+			}
+		}))
+		defer server.Close()
+
+		if _, err := testBearerClient(server.URL, time.Nanosecond).ListDevices(context.Background(), "as", "access-token"); err == nil {
+			t.Fatal("ListDevices() error = nil, want family thing error")
+		}
+	})
+
+	t.Run("fails when a family pagination cursor does not advance", func(t *testing.T) {
+		var requests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if requests.Add(1) == 1 {
+				io.WriteString(w, `{"error":0,"data":{"familyList":[{"id":"family-a"}]}}`)
+				return
+			}
+			io.WriteString(w, `{"error":0,"data":{"total":100,"thingList":[{"itemType":3,"index":10,"itemData":{}}]}}`)
+		}))
+		defer server.Close()
+
+		if _, err := testBearerClient(server.URL, time.Nanosecond).ListDevices(context.Background(), "as", "access-token"); err == nil {
+			t.Fatal("ListDevices() error = nil, want repeated pagination cursor error")
+		}
+		if got := requests.Load(); got != 3 {
+			t.Fatalf("request count = %d, want 3", got)
+		}
+	})
+}
+
+func assertThingListQuery(t *testing.T, r *http.Request, familyID, beginIndex string) {
+	t.Helper()
+	if r.Method != http.MethodGet || r.URL.Path != "/v2/device/thing" {
+		t.Fatalf("request = %s %s, want GET /v2/device/thing", r.Method, r.URL.String())
+	}
+	query := r.URL.Query()
+	if got := query.Get("familyid"); got != familyID {
+		t.Errorf("familyid = %q, want %q", got, familyID)
+	}
+	if got := query.Get("num"); got != "30" {
+		t.Errorf("num = %q, want 30", got)
+	}
+	if got := query.Get("beginIndex"); got != beginIndex {
+		t.Errorf("beginIndex = %q, want %q", got, beginIndex)
 	}
 }
 
@@ -65,6 +181,10 @@ func TestClientListDevicesStopsOnEmptyPage(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if requests.Add(1) == 1 {
+			io.WriteString(w, `{"error":0,"data":{"familyList":[{"id":"family"}]}}`)
+			return
+		}
+		if requests.Load() == 2 {
 			io.WriteString(w, `{"error":0,"msg":"","data":{"total":10,"thingList":[]}}`)
 			return
 		}
@@ -82,7 +202,11 @@ func TestClientListDevicesRejectsRepeatedPaginationCursor(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		request := requests.Add(1)
-		if request > 3 {
+		if request == 1 {
+			io.WriteString(w, `{"error":0,"data":{"familyList":[{"id":"family"}]}}`)
+			return
+		}
+		if request > 4 {
 			t.Fatal("ListDevices did not stop after repeated cursor")
 		}
 		io.WriteString(w, `{"error":0,"msg":"","data":{"total":100,"thingList":[{"itemType":3,"index":10,"itemData":{}}]}}`)
@@ -93,8 +217,8 @@ func TestClientListDevicesRejectsRepeatedPaginationCursor(t *testing.T) {
 	if err == nil {
 		t.Fatal("ListDevices() error = nil, want repeated pagination cursor error")
 	}
-	if got := requests.Load(); got != 2 {
-		t.Fatalf("request count = %d, want 2", got)
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("request count = %d, want 3", got)
 	}
 }
 
@@ -122,6 +246,98 @@ func TestClientGetDeviceUsesSpecifiedThing(t *testing.T) {
 	want := Device{DeviceID: "device-1", Name: "Plug", Online: true, State: "off", UIID: 6, Model: "MINI"}
 	if got != want {
 		t.Fatalf("GetDevice() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSwitchDescriptorFormats(t *testing.T) {
+	tests := []struct {
+		name       string
+		paramsJSON string
+		wantState  string
+		wantMode   switchMode
+		wantOK     bool
+	}{
+		{"valid outlet zero", `{"switches":[{"outlet":0,"switch":"on"}]}`, "on", switchModeOutletZero, true},
+		{"only another outlet", `{"switches":[{"outlet":1,"switch":"on"}]}`, "", 0, false},
+		{"duplicate outlet zero", `{"switches":[{"outlet":0,"switch":"on"},{"outlet":0,"switch":"off"}]}`, "", 0, false},
+		{"missing outlet", `{"switches":[{"switch":"on"}]}`, "", 0, false},
+		{"invalid outlet zero state", `{"switches":[{"outlet":0,"switch":"toggle"}]}`, "", 0, false},
+		{"switches is object", `{"switches":{"outlet":0,"switch":"on"}}`, "", 0, false},
+		{"switches is null", `{"switches":null}`, "", 0, false},
+		{"scalar takes precedence", `{"switch":"off","switches":[{"outlet":0,"switch":"on"}]}`, "off", switchModeScalar, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var item thing
+			item.ItemType = 1
+			item.ItemData.DeviceID = "device"
+			if err := json.Unmarshal([]byte(tt.paramsJSON), &item.ItemData.Params); err != nil {
+				t.Fatal(err)
+			}
+			device, mode, ok := switchDescriptor(item)
+			if ok != tt.wantOK || mode != tt.wantMode || device.State != tt.wantState {
+				t.Fatalf("switchDescriptor() = (%#v, %v, %v), want state %q, mode %v, ok %v", device, mode, ok, tt.wantState, tt.wantMode, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestClientGetDeviceSupportsOwnedAndSharedSwitchFormats(t *testing.T) {
+	tests := []struct {
+		name       string
+		itemType   int
+		paramsJSON string
+		wantState  string
+	}{
+		{"owned outlet zero", 1, `{"switches":[{"outlet":0,"switch":"on"}]}`, "on"},
+		{"shared outlet zero", 2, `{"switches":[{"outlet":0,"switch":"off"}]}`, "off"},
+		{"scalar takes precedence", 1, `{"switch":"off","switches":[{"outlet":0,"switch":"on"}]}`, "off"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `{"error":0,"data":{"thingList":[{"itemType":%d,"itemData":{"deviceid":"device","name":"Switch","params":%s}}]}}`, tt.itemType, tt.paramsJSON)
+			}))
+			defer server.Close()
+
+			got, err := testBearerClient(server.URL, time.Nanosecond).GetDevice(context.Background(), "as", "token", "device")
+			if err != nil {
+				t.Fatalf("GetDevice() error = %v", err)
+			}
+			if got.State != tt.wantState {
+				t.Fatalf("GetDevice().State = %q, want %q", got.State, tt.wantState)
+			}
+		})
+	}
+}
+
+func TestClientGetThingReturnsRawThingDescriptorAndMode(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := string(body), `{"thingList":[{"itemType":1,"id":"device"},{"itemType":2,"id":"device"}]}`; got != want {
+			t.Errorf("body = %q, want %q", got, want)
+		}
+		io.WriteString(w, `{"error":0,"data":{"thingList":[`+
+			`{"itemType":1,"itemData":{"deviceid":"device","params":{"switches":[]}}},`+
+			`{"itemType":2,"itemData":{"deviceid":"device","name":"Shared","params":{"switches":[{"outlet":0,"switch":"on"}]}}}`+
+			`]}}`)
+	}))
+	defer server.Close()
+
+	item, device, mode, err := testBearerClient(server.URL, time.Nanosecond).getThing(context.Background(), "as", "token", "device")
+	if err != nil {
+		t.Fatalf("getThing() error = %v", err)
+	}
+	if item.ItemType != 2 || device.DeviceID != "device" || device.State != "on" || mode != switchModeOutletZero {
+		t.Fatalf("getThing() = (%#v, %#v, %v), want shared outlet-zero device", item, device, mode)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("request count = %d, want 1", got)
 	}
 }
 
