@@ -218,24 +218,27 @@ func TestDeviceRoutesRejectRawDotSegmentsWithoutRedirect(t *testing.T) {
 }
 
 func TestWrongMethodsReturnStableJSON(t *testing.T) {
-	tests := []struct{ method, path string }{
-		{http.MethodPost, "/healthz"},
-		{http.MethodHead, "/healthz"},
-		{http.MethodPost, "/oauth/start"},
-		{http.MethodHead, "/oauth/start"},
-		{http.MethodPost, "/callback"},
-		{http.MethodHead, "/callback"},
-		{http.MethodPost, "/api/v1/devices"},
-		{http.MethodHead, "/api/v1/devices"},
-		{http.MethodPost, "/api/v1/devices/abc/status"},
-		{http.MethodHead, "/api/v1/devices/abc/status"},
-		{http.MethodPost, "/api/v1/devices/abc/switch"},
-		{http.MethodGet, "/api/v1/devices/abc/switch"},
+	tests := []struct{ method, path, allow string }{
+		{http.MethodPost, "/healthz", http.MethodGet},
+		{http.MethodHead, "/healthz", http.MethodGet},
+		{http.MethodPost, "/oauth/start", http.MethodGet},
+		{http.MethodHead, "/oauth/start", http.MethodGet},
+		{http.MethodPost, "/callback", http.MethodGet},
+		{http.MethodHead, "/callback", http.MethodGet},
+		{http.MethodPost, "/api/v1/devices", http.MethodGet},
+		{http.MethodHead, "/api/v1/devices", http.MethodGet},
+		{http.MethodPost, "/api/v1/devices/abc/status", http.MethodGet},
+		{http.MethodHead, "/api/v1/devices/abc/status", http.MethodGet},
+		{http.MethodPost, "/api/v1/devices/abc/switch", http.MethodPut},
+		{http.MethodGet, "/api/v1/devices/abc/switch", http.MethodPut},
 	}
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
 			rec := request(t, testHandler(nil, nil, nil, nil, nil), tt.method, tt.path, "")
 			assertResponse(t, rec, http.StatusMethodNotAllowed, "{\"error\":{\"code\":\"method_not_allowed\",\"message\":\"method not allowed\"}}\n")
+			if got := rec.Header().Get("Allow"); got != tt.allow {
+				t.Fatalf("Allow = %q, want %q", got, tt.allow)
+			}
 		})
 	}
 }

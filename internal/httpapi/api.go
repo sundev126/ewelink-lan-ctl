@@ -74,13 +74,17 @@ func New(config Config) http.Handler {
 	}
 	a := &api{gateway: config.Gateway, oauth: config.OAuth, tokens: config.Tokens, now: now, logger: logger, states: make(map[string]time.Time)}
 	mux := http.NewServeMux()
-	methodNotAllowed := func(w http.ResponseWriter, _ *http.Request) {
-		writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+	methodNotAllowed := func(allow string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Allow", allow)
+			writeAPIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		}
 	}
 	exactMethod := func(method string, handler http.HandlerFunc) http.HandlerFunc {
+		fallback := methodNotAllowed(method)
 		return func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != method {
-				methodNotAllowed(w, r)
+				fallback(w, r)
 				return
 			}
 			handler(w, r)
@@ -92,12 +96,13 @@ func New(config Config) http.Handler {
 	mux.HandleFunc("GET /api/v1/devices", exactMethod(http.MethodGet, a.devices))
 	mux.HandleFunc("GET /api/v1/devices/{device_id}/status", exactMethod(http.MethodGet, a.status))
 	mux.HandleFunc("PUT /api/v1/devices/{device_id}/switch", exactMethod(http.MethodPut, a.setSwitch))
-	mux.HandleFunc("/healthz", methodNotAllowed)
-	mux.HandleFunc("/oauth/start", methodNotAllowed)
-	mux.HandleFunc("/callback", methodNotAllowed)
-	mux.HandleFunc("/api/v1/devices", methodNotAllowed)
-	mux.HandleFunc("/api/v1/devices/{device_id}/status", methodNotAllowed)
-	mux.HandleFunc("/api/v1/devices/{device_id}/switch", methodNotAllowed)
+	getOnly := methodNotAllowed(http.MethodGet)
+	mux.HandleFunc("/healthz", getOnly)
+	mux.HandleFunc("/oauth/start", getOnly)
+	mux.HandleFunc("/callback", getOnly)
+	mux.HandleFunc("/api/v1/devices", getOnly)
+	mux.HandleFunc("/api/v1/devices/{device_id}/status", getOnly)
+	mux.HandleFunc("/api/v1/devices/{device_id}/switch", methodNotAllowed(http.MethodPut))
 	notFound := func(w http.ResponseWriter, _ *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "not_found", "not found")
 	}
