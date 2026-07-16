@@ -35,8 +35,8 @@ func TestClientListDevicesPaginatesAndFiltersUnsupportedThings(t *testing.T) {
 				t.Errorf("second beginIndex = %q, want 42", got)
 			}
 			io.WriteString(w, `{"error":0,"msg":"","data":{"total":5,"thingList":[`+
-				`{"itemType":1,"itemData":{"deviceid":"multi","name":"Multi","online":true,"params":{"switches":[{"switch":"on","outlet":0}]},"extra":{"uiid":2,"model":"DUAL"}}},`+
-				`{"itemType":1,"itemData":{"deviceid":"bad-state","name":"Bad","online":true,"params":{"switch":"toggle"},"extra":{"uiid":3,"model":"ODD"}}}`+
+				`{"itemType":1,"index":50,"itemData":{"deviceid":"multi","name":"Multi","online":true,"params":{"switches":[{"switch":"on","outlet":0}]},"extra":{"uiid":2,"model":"DUAL"}}},`+
+				`{"itemType":1,"index":60,"itemData":{"deviceid":"bad-state","name":"Bad","online":true,"params":{"switch":"toggle"},"extra":{"uiid":3,"model":"ODD"}}}`+
 				`]}}`)
 		default:
 			t.Errorf("unexpected request %d", requests.Load())
@@ -75,6 +75,26 @@ func TestClientListDevicesStopsOnEmptyPage(t *testing.T) {
 	got, err := testBearerClient(server.URL, time.Nanosecond).ListDevices(context.Background(), "cn", "access-token")
 	if err != nil || len(got) != 0 {
 		t.Fatalf("ListDevices() = %#v, %v; want empty, nil", got, err)
+	}
+}
+
+func TestClientListDevicesRejectsRepeatedPaginationCursor(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		request := requests.Add(1)
+		if request > 3 {
+			t.Fatal("ListDevices did not stop after repeated cursor")
+		}
+		io.WriteString(w, `{"error":0,"msg":"","data":{"total":100,"thingList":[{"itemType":3,"index":10,"itemData":{}}]}}`)
+	}))
+	defer server.Close()
+
+	_, err := testBearerClient(server.URL, time.Nanosecond).ListDevices(context.Background(), "as", "access-token")
+	if err == nil {
+		t.Fatal("ListDevices() error = nil, want repeated pagination cursor error")
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("request count = %d, want 2", got)
 	}
 }
 
@@ -117,6 +137,24 @@ func TestClientGetDeviceSupportsSharedThingAndValidatesIdentity(t *testing.T) {
 	}
 	if got.DeviceID != "shared" || got.State != "off" {
 		t.Fatalf("GetDevice() = %#v, want matching shared device", got)
+	}
+}
+
+func TestClientGetDeviceScansPastUnsupportedMatchingCandidate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"error":0,"msg":"","data":{"thingList":[`+
+			`{"itemType":1,"itemData":{"deviceid":"device","params":{"switches":[{"switch":"on"}]} }},`+
+			`{"itemType":2,"itemData":{"deviceid":"device","name":"Shared","online":true,"params":{"switch":"on"},"extra":{"uiid":5,"model":"S20"}}}`+
+			`]}}`)
+	}))
+	defer server.Close()
+
+	got, err := testBearerClient(server.URL, time.Nanosecond).GetDevice(context.Background(), "as", "access-token", "device")
+	if err != nil {
+		t.Fatalf("GetDevice() error = %v", err)
+	}
+	if got.DeviceID != "device" || got.State != "on" || got.UIID != 5 {
+		t.Fatalf("GetDevice() = %#v, want supported matching candidate", got)
 	}
 }
 
@@ -202,6 +240,36 @@ func TestClientErrorMalformedSuccessJSON(t *testing.T) {
 	}
 }
 
+func TestClientErrorRequiresNumericEnvelopeErrorOnRead(t *testing.T) {
+	for _, response := range []string{`{}`, `{"error":null,"data":{"thingList":[]}}`} {
+		t.Run(response, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				io.WriteString(w, response)
+			}))
+			defer server.Close()
+
+			if _, err := testBearerClient(server.URL, time.Nanosecond).ListDevices(context.Background(), "as", "token"); err == nil {
+				t.Fatal("ListDevices() error = nil, want invalid envelope error")
+			}
+		})
+	}
+}
+
+func TestClientErrorRequiresNumericEnvelopeErrorOnWrite(t *testing.T) {
+	for _, response := range []string{`{}`, `{"error":null,"data":{}}`} {
+		t.Run(response, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				io.WriteString(w, response)
+			}))
+			defer server.Close()
+
+			if err := testBearerClient(server.URL, time.Nanosecond).SetSwitch(context.Background(), "as", "token", "id", "on"); err == nil {
+				t.Fatal("SetSwitch() error = nil, want invalid envelope error")
+			}
+		})
+	}
+}
+
 func TestClientLimitWaitHonorsCancellation(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -250,6 +318,13 @@ func TestClientLimitDefaultGateIsProcessWide(t *testing.T) {
 	}
 }
 
+func TestClientLimitProductionConstructorUsesSharedGate(t *testing.T) {
+	client := NewClient(Config{})
+	if client.gate != productionRequestGate {
+		t.Fatal("NewClient() did not use process-wide production request gate")
+	}
+}
+
 func assertBearerHeaders(t *testing.T, r *http.Request) {
 	t.Helper()
 	if got, want := r.Header.Get("Authorization"), "Bearer access-token"; got != want {
@@ -261,12 +336,13 @@ func assertBearerHeaders(t *testing.T, r *http.Request) {
 }
 
 func testBearerClient(baseURL string, interval time.Duration) *Client {
-	return NewClient(Config{
-		AppID:           "app-id",
-		AppSecret:       "secret",
-		CallbackURL:     "http://callback",
-		HTTPClient:      http.DefaultClient,
-		RegionBaseURL:   func(string) (string, error) { return baseURL, nil },
-		RequestInterval: interval,
+	client := NewClient(Config{
+		AppID:         "app-id",
+		AppSecret:     "secret",
+		CallbackURL:   "http://callback",
+		HTTPClient:    http.DefaultClient,
+		RegionBaseURL: func(string) (string, error) { return baseURL, nil },
 	})
+	client.gate = newRequestGate(interval, time.Now)
+	return client
 }

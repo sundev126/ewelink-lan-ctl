@@ -23,13 +23,12 @@ import (
 const authorizationEndpoint = "https://c2ccdn.coolkit.cc/oauth/index.html"
 
 type Config struct {
-	AppID           string
-	AppSecret       string
-	CallbackURL     string
-	HTTPClient      *http.Client
-	Now             func() time.Time
-	RegionBaseURL   func(string) (string, error)
-	RequestInterval time.Duration
+	AppID         string
+	AppSecret     string
+	CallbackURL   string
+	HTTPClient    *http.Client
+	Now           func() time.Time
+	RegionBaseURL func(string) (string, error)
 }
 
 type Client struct {
@@ -50,6 +49,21 @@ type requestGate struct {
 	now           func() time.Time
 }
 
+type optionalMillis struct {
+	present bool
+	null    bool
+	value   int64
+}
+
+func (m *optionalMillis) UnmarshalJSON(data []byte) error {
+	m.present = true
+	if bytes.Equal(data, []byte("null")) {
+		m.null = true
+		return nil
+	}
+	return json.Unmarshal(data, &m.value)
+}
+
 var productionRequestGate = newRequestGate(500*time.Millisecond, time.Now)
 
 func NewClient(config Config) *Client {
@@ -65,10 +79,6 @@ func NewClient(config Config) *Client {
 	if baseURL == nil {
 		baseURL = regionBaseURL
 	}
-	gate := productionRequestGate
-	if config.RequestInterval != 0 {
-		gate = newRequestGate(config.RequestInterval, now)
-	}
 	return &Client{
 		appID:       config.AppID,
 		appSecret:   config.AppSecret,
@@ -76,7 +86,7 @@ func NewClient(config Config) *Client {
 		httpClient:  httpClient,
 		now:         now,
 		baseURL:     baseURL,
-		gate:        gate,
+		gate:        productionRequestGate,
 	}
 }
 
@@ -158,25 +168,26 @@ func (c *Client) Refresh(ctx context.Context, region, refreshToken string) (stor
 		return store.Credentials{}, fmt.Errorf("encode token refresh: %w", err)
 	}
 	var response struct {
-		AccessToken           string `json:"at"`
-		RefreshToken          string `json:"rt"`
-		AccessTokenExpiresAt  int64  `json:"atExpiredTime"`
-		RefreshTokenExpiresAt int64  `json:"rtExpiredTime"`
+		AccessToken           string         `json:"at"`
+		RefreshToken          string         `json:"rt"`
+		AccessTokenExpiresAt  optionalMillis `json:"atExpiredTime"`
+		RefreshTokenExpiresAt optionalMillis `json:"rtExpiredTime"`
 	}
 	if err := c.signedPost(ctx, region, "/v2/user/refresh", body, &response); err != nil {
 		return store.Credentials{}, fmt.Errorf("refresh oauth token: %w", err)
 	}
-	if response.AccessToken == "" || response.RefreshToken == "" || response.AccessTokenExpiresAt < 0 || response.RefreshTokenExpiresAt < 0 {
+	if response.AccessToken == "" || response.RefreshToken == "" ||
+		invalidOptionalExpiry(response.AccessTokenExpiresAt) || invalidOptionalExpiry(response.RefreshTokenExpiresAt) {
 		return store.Credentials{}, fmt.Errorf("refresh oauth token: incomplete credential data")
 	}
 	now := c.now()
-	accessExpiry := time.UnixMilli(response.AccessTokenExpiresAt)
-	if response.AccessTokenExpiresAt == 0 {
-		accessExpiry = now.Add(30 * 24 * time.Hour)
+	accessExpiry := now.Add(30 * 24 * time.Hour)
+	if response.AccessTokenExpiresAt.present {
+		accessExpiry = time.UnixMilli(response.AccessTokenExpiresAt.value)
 	}
-	refreshExpiry := time.UnixMilli(response.RefreshTokenExpiresAt)
-	if response.RefreshTokenExpiresAt == 0 {
-		refreshExpiry = now.Add(60 * 24 * time.Hour)
+	refreshExpiry := now.Add(60 * 24 * time.Hour)
+	if response.RefreshTokenExpiresAt.present {
+		refreshExpiry = time.UnixMilli(response.RefreshTokenExpiresAt.value)
 	}
 	return store.Credentials{
 		Region:                region,
@@ -185,6 +196,10 @@ func (c *Client) Refresh(ctx context.Context, region, refreshToken string) (stor
 		RefreshToken:          response.RefreshToken,
 		RefreshTokenExpiresAt: refreshExpiry.UTC(),
 	}, nil
+}
+
+func invalidOptionalExpiry(expiry optionalMillis) bool {
+	return expiry.present && (expiry.null || expiry.value <= 0)
 }
 
 func (c *Client) signedPost(ctx context.Context, region, path string, body []byte, target any) error {
@@ -215,7 +230,7 @@ func (c *Client) do(ctx context.Context, region, method, path string, body []byt
 	defer response.Body.Close()
 
 	var envelope struct {
-		Error int             `json:"error"`
+		Error json.RawMessage `json:"error"`
 		Msg   string          `json:"msg"`
 		Data  json.RawMessage `json:"data"`
 	}
@@ -233,13 +248,20 @@ func (c *Client) do(ctx context.Context, region, method, path string, body []byt
 		}
 		return fmt.Errorf("decode ewelink response trailing data: %w", err)
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 || envelope.Error != 0 {
+	if len(envelope.Error) == 0 || bytes.Equal(envelope.Error, []byte("null")) {
+		return fmt.Errorf("decode ewelink response: missing numeric error field")
+	}
+	var errorCode int
+	if err := json.Unmarshal(envelope.Error, &errorCode); err != nil {
+		return fmt.Errorf("decode ewelink response error field: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 || errorCode != 0 {
 		message := envelope.Msg
 		if message == "" {
 			message = response.Status
 
 		}
-		return &UpstreamError{HTTPStatus: response.StatusCode, Code: envelope.Error, Message: message}
+		return &UpstreamError{HTTPStatus: response.StatusCode, Code: errorCode, Message: message}
 	}
 	if target != nil {
 		if err := json.Unmarshal(envelope.Data, target); err != nil {

@@ -49,13 +49,17 @@ func (c *Client) ListDevices(ctx context.Context, region, token string) ([]Devic
 		if len(page.ThingList) == 0 {
 			break
 		}
+		nextIndex := page.ThingList[len(page.ThingList)-1].Index
+		if nextIndex <= beginIndex {
+			return nil, fmt.Errorf("list ewelink devices: pagination cursor did not advance from %d to %d", beginIndex, nextIndex)
+		}
 		for _, item := range page.ThingList {
 			if device, ok := supportedDevice(item); ok {
 				devices = append(devices, device)
 			}
 		}
 		fetched += len(page.ThingList)
-		beginIndex = page.ThingList[len(page.ThingList)-1].Index
+		beginIndex = nextIndex
 		if fetched >= page.Total {
 			break
 		}
@@ -82,15 +86,20 @@ func (c *Client) GetDevice(ctx context.Context, region, token, deviceID string) 
 	if err := c.bearerRequest(ctx, region, token, http.MethodPost, "/v2/device/thing", body, &response); err != nil {
 		return Device{}, fmt.Errorf("get ewelink device: %w", err)
 	}
+	matchedUnsupported := false
 	for _, item := range response.ThingList {
 		if item.ItemData.DeviceID != deviceID {
 			continue
 		}
 		device, ok := supportedDevice(item)
 		if !ok {
-			return Device{}, fmt.Errorf("ewelink device %q does not expose a scalar on/off switch", deviceID)
+			matchedUnsupported = true
+			continue
 		}
 		return device, nil
+	}
+	if matchedUnsupported {
+		return Device{}, fmt.Errorf("ewelink device %q does not expose a scalar on/off switch", deviceID)
 	}
 	return Device{}, fmt.Errorf("get ewelink device %q: matching thing not returned", deviceID)
 }

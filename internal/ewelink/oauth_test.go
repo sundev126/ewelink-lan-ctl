@@ -192,6 +192,21 @@ func TestRefreshRejectsIncompleteSuccessData(t *testing.T) {
 	}
 }
 
+func TestRefreshRejectsExplicitInvalidExpiries(t *testing.T) {
+	for _, expiry := range []string{"0", "null", "-1"} {
+		t.Run(expiry, func(t *testing.T) {
+			server := oauthServer(t, func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+				io.WriteString(w, `{"error":0,"msg":"","data":{"at":"access","rt":"refresh","atExpiredTime":`+expiry+`,"rtExpiredTime":`+expiry+`}}`)
+			})
+			defer server.Close()
+
+			if _, err := testOAuthClient(server.URL, "http://callback", time.Unix(1, 0)).Refresh(context.Background(), "as", "refresh"); err == nil {
+				t.Fatalf("Refresh() with explicit expiry %s error = nil, want error", expiry)
+			}
+		})
+	}
+}
+
 func oauthServer(t *testing.T, handler func(http.ResponseWriter, *http.Request, []byte)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -218,15 +233,16 @@ func assertSignedHeaders(t *testing.T, r *http.Request, appID, secret, body stri
 }
 
 func testOAuthClient(baseURL, callback string, now time.Time) *Client {
-	return NewClient(Config{
-		AppID:           "app-id",
-		AppSecret:       "secret",
-		CallbackURL:     callback,
-		HTTPClient:      http.DefaultClient,
-		Now:             func() time.Time { return now },
-		RegionBaseURL:   func(string) (string, error) { return baseURL, nil },
-		RequestInterval: time.Nanosecond,
+	client := NewClient(Config{
+		AppID:         "app-id",
+		AppSecret:     "secret",
+		CallbackURL:   callback,
+		HTTPClient:    http.DefaultClient,
+		Now:           func() time.Time { return now },
+		RegionBaseURL: func(string) (string, error) { return baseURL, nil },
 	})
+	client.gate = newRequestGate(time.Nanosecond, time.Now)
+	return client
 }
 
 func decodeJSONBody(t *testing.T, body []byte, target any) {
