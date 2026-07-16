@@ -20,6 +20,15 @@ type Credentials struct {
 	RefreshTokenExpiresAt time.Time `json:"refresh_token_expires_at"`
 }
 
+func ValidRegion(region string) bool {
+	switch region {
+	case "cn", "as", "us", "eu":
+		return true
+	default:
+		return false
+	}
+}
+
 type File struct {
 	Path string
 }

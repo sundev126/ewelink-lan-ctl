@@ -204,8 +204,8 @@ func TestSaveFailurePreservesOldState(t *testing.T) {
 	// Seed via a manager whose initial Set can succeed, then make the save callback fail.
 	m = newTestManager(nil, func(store.Credentials) error { return wantErr }, func(context.Context, store.Credentials) (store.Credentials, error) { return fresh, nil }, func() time.Time { return testNow })
 	m.setCurrentForTest(old)
-	if err := m.ForceRefresh(context.Background()); !errors.Is(err, wantErr) {
-		t.Fatalf("ForceRefresh() error = %v", err)
+	if err := m.ForceRefresh(context.Background()); !errors.Is(err, wantErr) || !errors.Is(err, ErrRefreshUnavailable) {
+		t.Fatalf("ForceRefresh() error = %v, want both persistence cause and ErrRefreshUnavailable", err)
 	}
 	if got := m.current(); got != old {
 		t.Fatalf("state changed after save failure: %#v", got)
@@ -782,7 +782,6 @@ func (m *Manager) currentGeneration() uint64 {
 
 func namedCredentials(name string, accessExpiry, refreshExpiry time.Time) store.Credentials {
 	credentials := credentials(accessExpiry, refreshExpiry)
-	credentials.Region = name + "-region"
 	credentials.AccessToken = name + "-access"
 	credentials.RefreshToken = name + "-refresh"
 	return credentials

@@ -97,6 +97,9 @@ func signBase64(key, message string) string {
 }
 
 func regionBaseURL(region string) (string, error) {
+	if !store.ValidRegion(region) {
+		return "", fmt.Errorf("unsupported ewelink region %q", region)
+	}
 	switch region {
 	case "cn":
 		return "https://cn-apia.coolkit.cn", nil

@@ -162,6 +162,45 @@ func TestBuildHandlerLogsMalformedStateAndStartsUnauthenticated(t *testing.T) {
 	}
 }
 
+func TestBuildHandlerRejectsStoredCredentialsWithInvalidRegion(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	data, err := json.Marshal(store.Credentials{
+		Region: "moon", AccessToken: "sensitive-access-token", RefreshToken: "sensitive-refresh-token",
+		AccessTokenExpiresAt:  time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC),
+		RefreshTokenExpiresAt: time.Date(2099, 2, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		AppID: "app-id", AppSecret: "app-secret", CallbackURL: "http://127.0.0.1/callback",
+		StateFile: statePath, RefreshAhead: 7 * 24 * time.Hour,
+	}
+	var logs bytes.Buffer
+	handler, _, err := buildHandler(cfg, &http.Client{Timeout: time.Second}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatalf("buildHandler() error = %v, want service to start unavailable", err)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if got := response.Body.String(); response.Code != http.StatusOK || !strings.Contains(got, `"oauth_ready":false`) {
+		t.Fatalf("GET /healthz = %d %s, want oauth_ready false", response.Code, got)
+	}
+	apiResponse := httptest.NewRecorder()
+	handler.ServeHTTP(apiResponse, httptest.NewRequest(http.MethodGet, "/api/v1/devices", nil))
+	if apiResponse.Code != http.StatusServiceUnavailable || !strings.Contains(apiResponse.Body.String(), `"code":"oauth_required"`) {
+		t.Fatalf("GET devices = %d %s, want stable OAuth unavailable response", apiResponse.Code, apiResponse.Body.String())
+	}
+	if got := logs.String(); !strings.Contains(got, `"category":"state_malformed"`) {
+		t.Fatalf("logs = %q, want state_malformed", got)
+	} else if strings.Contains(got, "sensitive-") || strings.Contains(got, "moon") {
+		t.Fatalf("invalid-region log leaked state detail: %q", got)
+	}
+}
+
 func TestRefreshAdapterMapsPermanentRejectionToOAuthRequired(t *testing.T) {
 	rejection := &ewelink.UpstreamError{HTTPStatus: http.StatusUnauthorized, Message: "sensitive provider detail"}
 	_, err := refreshWith(stubRefreshClient{err: rejection})(context.Background(), store.Credentials{

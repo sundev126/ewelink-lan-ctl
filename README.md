@@ -7,7 +7,7 @@
 
 ## Security model
 
-Every `/api/v1` route is intentionally unauthenticated. Anyone who can reach port `33998` can list the supported devices and turn them on or off. Keep the service on a trusted LAN or VPN, restrict it with a firewall or authenticated reverse proxy, and do not publish it directly to the internet. OAuth uses a one-time `state`, but that protects the account-binding callback; it does not authenticate API callers.
+The entire service is intentionally unauthenticated. Anyone who can reach port `33998` can list the supported devices, turn them on or off, and call `/oauth/start` plus `/callback` to persistently rebind the service to another eWeLink account. Keep every route on a trusted LAN or VPN, or place the whole service behind an authenticated reverse proxy or equivalent access control. Do not publish port `33998` directly to the internet. OAuth's one-time `state` only protects callback correlation and replay; it does not authenticate callers or prevent an accessible client from starting a new account binding.
 
 The service persists OAuth credentials in `state.json`. Protect that file as a secret. Device metadata and device state are not cached.
 

@@ -11,7 +11,10 @@ import (
 	"github.com/zm/ewelink-lan-ctl/internal/store"
 )
 
-var ErrOAuthRequired = errors.New("oauth authorization required")
+var (
+	ErrOAuthRequired      = errors.New("oauth authorization required")
+	ErrRefreshUnavailable = errors.New("token refresh unavailable")
+)
 
 const accessSafetyWindow = 5 * time.Minute
 
@@ -24,6 +27,11 @@ type refreshCall struct {
 	err        error
 	applied    bool
 	generation uint64
+}
+
+type accessIdentity struct {
+	region string
+	token  string
 }
 
 type Manager struct {
@@ -129,7 +137,7 @@ func (m *Manager) Access(ctx context.Context) (region, token string, err error) 
 		if !needsRefresh(credentials, m.now(), accessSafetyWindow) {
 			return credentials.Region, credentials.AccessToken, nil
 		}
-		applied, err := m.refreshCredentials(ctx, accessSafetyWindow, false)
+		applied, err := m.refreshCredentials(ctx, accessSafetyWindow, false, nil)
 		if err != nil {
 			return "", "", err
 		}
@@ -140,23 +148,35 @@ func (m *Manager) Access(ctx context.Context) (region, token string, err error) 
 }
 
 func (m *Manager) ForceRefresh(ctx context.Context) error {
-	applied, err := m.refreshCredentials(ctx, 0, true)
+	applied, err := m.refreshCredentials(ctx, 0, true, nil)
 	if err != nil || applied {
 		return err
 	}
 	return m.ensureRefresh(ctx, accessSafetyWindow, false)
 }
 
-func (m *Manager) ensureRefresh(ctx context.Context, ahead time.Duration, force bool) error {
+// RefreshIfCurrent refreshes only when the rejected access token is still the
+// manager's current token. A concurrent successful refresh makes this a no-op.
+func (m *Manager) RefreshIfCurrent(ctx context.Context, region, accessToken string) error {
+	expected := &accessIdentity{region: region, token: accessToken}
 	for {
-		applied, err := m.refreshCredentials(ctx, ahead, force)
+		applied, err := m.refreshCredentials(ctx, 0, true, expected)
 		if err != nil || applied {
 			return err
 		}
 	}
 }
 
-func (m *Manager) refreshCredentials(ctx context.Context, ahead time.Duration, force bool) (bool, error) {
+func (m *Manager) ensureRefresh(ctx context.Context, ahead time.Duration, force bool) error {
+	for {
+		applied, err := m.refreshCredentials(ctx, ahead, force, nil)
+		if err != nil || applied {
+			return err
+		}
+	}
+}
+
+func (m *Manager) refreshCredentials(ctx context.Context, ahead time.Duration, force bool, expected *accessIdentity) (bool, error) {
 	m.mu.Lock()
 	if m.inFlight != nil {
 		call := m.inFlight
@@ -174,6 +194,10 @@ func (m *Manager) refreshCredentials(ctx context.Context, ahead time.Duration, f
 	}
 	credentials := m.credentials
 	generation := m.generation
+	if expected != nil && (credentials.Region != expected.region || credentials.AccessToken != expected.token) {
+		m.mu.Unlock()
+		return true, nil
+	}
 	if !force && !needsRefresh(credentials, m.now(), ahead) {
 		m.mu.Unlock()
 		return true, nil
@@ -231,10 +255,10 @@ func (m *Manager) commitRefresh(generation uint64, fresh store.Credentials, refr
 		return true, fmt.Errorf("refresh credentials: %w", err)
 	}
 	if m.save == nil {
-		return true, fmt.Errorf("save refreshed credentials: callback is nil")
+		return true, fmt.Errorf("%w: save refreshed credentials: callback is nil", ErrRefreshUnavailable)
 	}
 	if err := m.save(fresh); err != nil {
-		return true, fmt.Errorf("save refreshed credentials: %w", err)
+		return true, fmt.Errorf("%w: save refreshed credentials: %w", ErrRefreshUnavailable, err)
 	}
 	m.mu.Lock()
 	if m.generation != generation {
@@ -306,7 +330,7 @@ func needsRefresh(credentials store.Credentials, now time.Time, ahead time.Durat
 }
 
 func validate(credentials store.Credentials) error {
-	if credentials.Region == "" || credentials.AccessToken == "" || credentials.RefreshToken == "" ||
+	if !store.ValidRegion(credentials.Region) || credentials.AccessToken == "" || credentials.RefreshToken == "" ||
 		credentials.AccessTokenExpiresAt.IsZero() || credentials.RefreshTokenExpiresAt.IsZero() {
 		return store.ErrMalformedCredentials
 	}

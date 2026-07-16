@@ -206,6 +206,48 @@ func TestDeviceAndSwitchErrorMappings(t *testing.T) {
 	}
 }
 
+type rejectedTokenListClient struct{}
+
+func (rejectedTokenListClient) ListDevices(context.Context, string, string) ([]ewelink.Device, error) {
+	return nil, &ewelink.UpstreamError{Code: http.StatusUnauthorized}
+}
+
+func (rejectedTokenListClient) GetDevice(context.Context, string, string, string) (ewelink.Device, error) {
+	panic("unexpected GetDevice")
+}
+
+func (rejectedTokenListClient) SetSwitch(context.Context, string, string, string, string) error {
+	panic("unexpected SetSwitch")
+}
+
+func TestRefreshPersistenceFailureReturnsStableServiceUnavailable(t *testing.T) {
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	old := validCredentials(now)
+	fresh := old
+	fresh.AccessToken = "new-access-secret"
+	var saves int
+	manager := token.New(nil, func(store.Credentials) error {
+		saves++
+		if saves > 1 {
+			return errors.New("disk full near refresh-secret")
+		}
+		return nil
+	}, func(context.Context, store.Credentials) (store.Credentials, error) {
+		return fresh, nil
+	}, func() time.Time { return now }, 7*24*time.Hour)
+	if err := manager.Set(old); err != nil {
+		t.Fatal(err)
+	}
+	logs := new(bytes.Buffer)
+	handler := testHandler(&ewelink.Gateway{Tokens: manager, Client: rejectedTokenListClient{}}, manager, nil, nil, logs)
+
+	rec := request(t, handler, http.MethodGet, "/api/v1/devices", "")
+	assertResponse(t, rec, http.StatusServiceUnavailable, "{\"error\":{\"code\":\"oauth_unavailable\",\"message\":\"OAuth credentials temporarily unavailable\"}}\n")
+	if strings.Contains(rec.Body.String()+logs.String(), "refresh-secret") {
+		t.Fatal("refresh persistence cause leaked in response or logs")
+	}
+}
+
 func TestSwitchRejectsOversizedBody(t *testing.T) {
 	body := `{"state":"` + strings.Repeat("x", maxSwitchBodyBytes) + `"}`
 	rec := request(t, testHandler(nil, nil, nil, nil, nil), http.MethodPut, "/api/v1/devices/abc/switch", body)

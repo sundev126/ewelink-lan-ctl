@@ -246,6 +246,9 @@ func classifyOperationError(err error) (int, string, string) {
 	if errors.Is(err, token.ErrOAuthRequired) {
 		return http.StatusServiceUnavailable, "oauth_required", "OAuth authorization required"
 	}
+	if errors.Is(err, token.ErrRefreshUnavailable) {
+		return http.StatusServiceUnavailable, "oauth_unavailable", "OAuth credentials temporarily unavailable"
+	}
 	if errors.Is(err, ewelink.ErrDeviceNotFound) {
 		return http.StatusNotFound, "device_not_found", "device not found"
 	}
@@ -338,7 +341,7 @@ func (a *api) callback(w http.ResponseWriter, r *http.Request) {
 	code, codeOK := oneQueryValue(query["code"])
 	region, regionOK := oneQueryValue(query["region"])
 	state, stateOK := oneQueryValue(query["state"])
-	if !codeOK || !regionOK || !stateOK || !validRegion(region) || !a.consumeState(state) {
+	if !codeOK || !regionOK || !stateOK || !store.ValidRegion(region) || !a.consumeState(state) {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request", "invalid OAuth callback")
 		return
 	}
@@ -369,15 +372,6 @@ func oneQueryValue(values []string) (string, bool) {
 		return "", false
 	}
 	return values[0], true
-}
-
-func validRegion(region string) bool {
-	switch region {
-	case "cn", "as", "us", "eu":
-		return true
-	default:
-		return false
-	}
 }
 
 func (a *api) consumeState(state string) bool {

@@ -5,7 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/zm/ewelink-lan-ctl/internal/store"
+	"github.com/zm/ewelink-lan-ctl/internal/token"
 )
 
 type gatewayTokenProvider struct {
@@ -29,7 +35,7 @@ func (p *gatewayTokenProvider) Access(ctx context.Context) (string, string, erro
 	return result.region, result.token, result.err
 }
 
-func (p *gatewayTokenProvider) ForceRefresh(ctx context.Context) error {
+func (p *gatewayTokenProvider) RefreshIfCurrent(ctx context.Context, _, _ string) error {
 	p.contexts = append(p.contexts, ctx)
 	p.refreshCalls++
 	return p.refreshErr
@@ -202,6 +208,87 @@ func TestGatewaySecondTokenFailureIsReturnedWithoutAnotherRetry(t *testing.T) {
 	}
 	if tokens.accessCalls != 2 || tokens.refreshCalls != 1 || len(client.calls) != 2 {
 		t.Fatalf("calls = access %d, refresh %d, client %d; want 2, 1, 2", tokens.accessCalls, tokens.refreshCalls, len(client.calls))
+	}
+}
+
+type lateTokenFailureClient struct {
+	oldCalls       atomic.Int32
+	secondOldReady chan struct{}
+	releaseSecond  chan struct{}
+}
+
+func (c *lateTokenFailureClient) ListDevices(_ context.Context, _, accessToken string) ([]Device, error) {
+	if accessToken == "fresh-token" {
+		return []Device{{DeviceID: "device-1"}}, nil
+	}
+	if c.oldCalls.Add(1) == 2 {
+		close(c.secondOldReady)
+		<-c.releaseSecond
+	} else {
+		<-c.secondOldReady
+	}
+	return nil, &UpstreamError{Code: 401}
+}
+
+func (*lateTokenFailureClient) GetDevice(context.Context, string, string, string) (Device, error) {
+	panic("unexpected GetDevice")
+}
+
+func (*lateTokenFailureClient) SetSwitch(context.Context, string, string, string, string) error {
+	panic("unexpected SetSwitch")
+}
+
+func TestGatewayLateOldTokenFailureDoesNotRefreshAgain(t *testing.T) {
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	old := store.Credentials{
+		Region: "us", AccessToken: "old-token", RefreshToken: "refresh-token",
+		AccessTokenExpiresAt: now.Add(time.Hour), RefreshTokenExpiresAt: now.Add(24 * time.Hour),
+	}
+	fresh := old
+	fresh.AccessToken = "fresh-token"
+	fresh.AccessTokenExpiresAt = now.Add(2 * time.Hour)
+	var refreshCalls atomic.Int32
+	refreshStarted := make(chan struct{})
+	manager := token.New(nil, func(store.Credentials) error { return nil }, func(context.Context, store.Credentials) (store.Credentials, error) {
+		if refreshCalls.Add(1) == 1 {
+			close(refreshStarted)
+		}
+		return fresh, nil
+	}, func() time.Time { return now }, 7*24*time.Hour)
+	if err := manager.Set(old); err != nil {
+		t.Fatal(err)
+	}
+	client := &lateTokenFailureClient{secondOldReady: make(chan struct{}), releaseSecond: make(chan struct{})}
+	gateway := &Gateway{Tokens: manager, Client: client}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			_, err := gateway.ListDevices(context.Background())
+			results <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	<-client.secondOldReady
+	select {
+	case <-refreshStarted:
+	case <-time.After(time.Second):
+		t.Fatal("token refresh did not start")
+	}
+	close(client.releaseSecond)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("ListDevices() error = %v", err)
+		}
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls = %d, want 1", got)
 	}
 }
 

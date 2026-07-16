@@ -4,7 +4,7 @@ import "context"
 
 type TokenProvider interface {
 	Access(context.Context) (string, string, error)
-	ForceRefresh(context.Context) error
+	RefreshIfCurrent(context.Context, string, string) error
 }
 
 type DeviceClient interface {
@@ -47,7 +47,7 @@ func gatewayCall[T any](ctx context.Context, gateway *Gateway, call func(string,
 	if !IsTokenError(err) {
 		return result, err
 	}
-	if err := gateway.Tokens.ForceRefresh(ctx); err != nil {
+	if err := gateway.Tokens.RefreshIfCurrent(ctx, region, token); err != nil {
 		var zero T
 		return zero, err
 	}
