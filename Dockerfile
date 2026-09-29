@@ -2,12 +2,18 @@ FROM golang:1.22-bookworm AS build
 
 WORKDIR /src
 
-COPY go.mod ./
-RUN go mod download
+ARG TASK_VERSION=3.53.1
+ARG TARGETOS
+ARG TARGETARCH
+
+ADD "https://github.com/go-task/task/releases/download/v${TASK_VERSION}/task_linux_${TARGETARCH}.tar.gz" /tmp/task.tar.gz
+RUN tar -xzf /tmp/task.tar.gz -C /usr/local/bin task
+
+COPY go.mod Taskfile.yml ./
+RUN task deps
 
 COPY . .
-RUN go test ./...
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/ewelink-lan-ctl ./cmd/ewelink-lan-ctl
+RUN task container GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" OUTPUT=/out/ewelink-lan-ctl
 RUN mkdir -p /out/data
 
 FROM gcr.io/distroless/static-debian12:nonroot

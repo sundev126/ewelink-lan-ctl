@@ -73,24 +73,26 @@ sudo ./uninstall.sh --purge
 
 ### 手动安装
 
-安装 CA 证书和 Go 1.22 或更高版本，然后构建二进制文件。Debian 12 的基础 `golang-go` 软件包可能比本模块要求的版本旧，因此请从 [go.dev/dl](https://go.dev/dl/) 安装当前 Go 版本，而不要依赖该软件包，并在构建前确认版本。
+安装 CA 证书、Go 1.22 或更高版本以及 [Go Task](https://taskfile.dev/docs/installation)，然后通过 Taskfile 构建二进制文件。Debian 12 的基础 `golang-go` 软件包可能比本模块要求的版本旧，因此请从 [go.dev/dl](https://go.dev/dl/) 安装当前 Go 版本，而不要依赖该软件包，并在构建前确认版本。
 
 ```bash
 sudo apt update
 sudo apt install -y ca-certificates
 go version  # 输出必须显示 go1.22 或更高版本
-go test ./...
-CGO_ENABLED=0 go build -trimpath -o ewelink-lan-ctl ./cmd/ewelink-lan-ctl
+task --version
+task build
 ```
 
-若要进行前台测试，请创建状态目录并加载私有环境：
+构建产物位于 `build/ewelink-lan-ctl`。使用 `task --list` 查看全部构建任务。
+
+若要进行前台运行验证，请创建状态目录并加载私有环境：
 
 ```bash
 mkdir -p data
 set -a
 . ./.env
 set +a
-./ewelink-lan-ctl
+./build/ewelink-lan-ctl
 ```
 
 ### systemd
@@ -98,7 +100,7 @@ set +a
 按上述方式构建，然后安装二进制文件和 unit。随附的 unit 以专用的 `ewelink` 用户运行，创建模式为 `0700` 的 `/var/lib/ewelink-lan-ctl`，并将文件系统写入权限限制在该状态目录内。
 
 ```bash
-sudo install -o root -g root -m 0755 ewelink-lan-ctl /usr/local/bin/ewelink-lan-ctl
+sudo install -o root -g root -m 0755 build/ewelink-lan-ctl /usr/local/bin/ewelink-lan-ctl
 sudo useradd --system --home-dir /var/lib/ewelink-lan-ctl --shell /usr/sbin/nologin ewelink
 sudo install -o root -g root -m 0644 deploy/ewelink-lan-ctl.service /etc/systemd/system/ewelink-lan-ctl.service
 sudo install -o root -g root -m 0600 .env /etc/ewelink-lan-ctl.env
@@ -117,7 +119,7 @@ sudo journalctl -u ewelink-lan-ctl -f
 
 ## Docker Compose
 
-发布镜像在 Debian Bookworm 上使用 Go 1.22 构建并测试静态二进制文件，然后在带有 CA 证书的 Debian 12 distroless 镜像中以非 root 用户运行该文件。`deploy/docker-compose.yml` 使用 GitHub Container Registry 中的 `latest` 镜像、普通端口发布（而不是 host 网络），并将凭据持久化到挂载在 `/data` 的命名 volume 中。
+发布镜像在 Debian Bookworm 上使用 Go 1.22 构建静态二进制文件，然后在带有 CA 证书的 Debian 12 distroless 镜像中以非 root 用户运行该文件。`deploy/docker-compose.yml` 使用 GitHub Container Registry 中的 `latest` 镜像、普通端口发布（而不是 host 网络），并将凭据持久化到挂载在 `/data` 的命名 volume 中。
 
 ```bash
 read -r -p 'EWELINK_APP_ID: ' EWELINK_APP_ID

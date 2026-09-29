@@ -12,7 +12,7 @@ permissions:
 jobs:
   release:
     name: 构建并发布
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CGO_ENABLED: "0"
 
@@ -26,33 +26,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: 运行测试
-        run: go test ./...
+      - name: 设置 Go Task
+        uses: go-task/setup-task@v2
+        with:
+          version: 3.53.1
 
       - name: 构建发布包
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME}"
-          mkdir -p dist/linux-amd64 dist/windows-amd64
-
-          GOOS=linux GOARCH=amd64 go build \
-            -trimpath -ldflags="-s -w" \
-            -o dist/linux-amd64/ewelink-lan-ctl \
-            ./cmd/ewelink-lan-ctl
-          GOOS=windows GOARCH=amd64 go build \
-            -trimpath -ldflags="-s -w" \
-            -o dist/windows-amd64/ewelink-lan-ctl.exe \
-            ./cmd/ewelink-lan-ctl
-
-          tar -C dist/linux-amd64 -czf \
-            "dist/ewelink-lan-ctl_${version}_linux_amd64.tar.gz" \
-            ewelink-lan-ctl
-          (cd dist/windows-amd64 && zip -q \
-            "../ewelink-lan-ctl_${version}_windows_amd64.zip" \
-            ewelink-lan-ctl.exe)
-          rm -rf dist/linux-amd64 dist/windows-amd64
-          (cd dist && sha256sum ./* > checksums.txt)
+        run: task release VERSION="$GITHUB_REF_NAME"
 
       - name: 生成容器镜像名称
         id: image

@@ -1,0 +1,97 @@
+version: '3'
+
+vars:
+  BINARY: ewelink-lan-ctl
+  HOST_ARCH:
+    sh: go env GOARCH
+
+tasks:
+  default:
+    desc: 检查并构建 Linux 二进制文件
+    cmds:
+      - task: build
+
+  deps:
+    desc: 下载 Go 模块依赖
+    cmd: go mod download
+
+  fmt:
+    desc: 格式化 Go 源代码
+    cmd: gofmt -w cmd internal
+
+  check:
+    desc: 检查格式并执行静态分析
+    cmds:
+      - |
+        unformatted="$(gofmt -l cmd internal)"
+        if [ -n "$unformatted" ]; then
+          printf '以下文件需要执行 task fmt：\n%s\n' "$unformatted" >&2
+          exit 1
+        fi
+      - go vet ./...
+
+  build:
+    desc: 构建当前 Linux 架构的二进制文件
+    cmds:
+      - task: check
+      - task: build-target
+        vars:
+          GOOS: linux
+          GOARCH: '{{.HOST_ARCH}}'
+          OUTPUT: 'build/{{.BINARY}}'
+
+  build-target:
+    internal: true
+    requires:
+      vars: [GOOS, GOARCH, OUTPUT]
+    cmds:
+      - mkdir -p "$(dirname -- '{{.OUTPUT}}')"
+      - >-
+        CGO_ENABLED=0 GOOS='{{.GOOS}}' GOARCH='{{.GOARCH}}'
+        go build -trimpath -ldflags='-s -w'
+        -o '{{.OUTPUT}}' ./cmd/ewelink-lan-ctl
+
+  container:
+    desc: 为容器目标平台构建二进制文件
+    requires:
+      vars: [GOOS, GOARCH, OUTPUT]
+    cmds:
+      - task: build-target
+        vars:
+          GOOS: '{{.GOOS}}'
+          GOARCH: '{{.GOARCH}}'
+          OUTPUT: '{{.OUTPUT}}'
+
+  release:
+    desc: 构建 Linux 和 Windows amd64 发布包
+    requires:
+      vars: [VERSION]
+    cmds:
+      - task: check
+      - rm -rf -- dist
+      - mkdir -p dist/linux-amd64 dist/windows-amd64
+      - task: build-target
+        vars:
+          GOOS: linux
+          GOARCH: amd64
+          OUTPUT: dist/linux-amd64/{{.BINARY}}
+      - task: build-target
+        vars:
+          GOOS: windows
+          GOARCH: amd64
+          OUTPUT: dist/windows-amd64/{{.BINARY}}.exe
+      - >-
+        tar -C dist/linux-amd64 -czf
+        'dist/{{.BINARY}}_{{.VERSION}}_linux_amd64.tar.gz'
+        '{{.BINARY}}'
+      - >-
+        cd dist/windows-amd64 && zip -q
+        '../{{.BINARY}}_{{.VERSION}}_windows_amd64.zip'
+        '{{.BINARY}}.exe'
+      - rm -rf -- dist/linux-amd64 dist/windows-amd64
+      - cd dist && sha256sum ./* > checksums.txt
+
+  clean:
+    desc: 删除本地构建和发布产物
+    cmds:
+      - rm -rf -- build dist

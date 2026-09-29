@@ -100,13 +100,12 @@ Token 生命周期包含以下处理：
 - 家庭、设备元数据或设备状态缓存。
 - 内置 API 身份认证和 iOS 原生应用。
 
-## 测试覆盖
+## 构建验证
 
-自动化测试覆盖配置校验、OAuth 签名与回调状态、区域选择、凭据原子存储、Token 刷新、家庭与设备分页、两种开关格式、上游错误映射、HTTP 契约以及进程组装。常规验收命令为：
+项目不维护自动化测试，统一使用 Go Task 执行格式化、静态检查和构建：
 
 ```bash
-go test ./...
-go test -race ./...
-go vet ./...
-go build ./cmd/ewelink-lan-ctl
+task fmt
+task check
+task build
 ```

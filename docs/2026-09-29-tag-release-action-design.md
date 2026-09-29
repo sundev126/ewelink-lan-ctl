@@ -2,7 +2,7 @@
 
 ## 目标
 
-当仓库收到以 `v` 开头的 tag 时，由 GitHub Actions 自动完成测试、二进制构建、容器镜像发布和 GitHub Release 发布。
+当仓库收到以 `v` 开头的 tag 时，由 GitHub Actions 自动完成二进制构建、容器镜像发布和 GitHub Release 发布。
 
 ## 触发规则
 
@@ -22,5 +22,6 @@
 
 - 使用工作流自带的 `GITHUB_TOKEN`，无需配置额外 token。
 - `contents: write` 用于创建 Release，`packages: write` 用于推送 GHCR 镜像。
+- GitHub Actions 安装 Go Task，并通过 `task release VERSION=<tag>` 统一构建发布包。
 - Go 二进制使用 `CGO_ENABLED=0`、`-trimpath` 和去除调试信息的链接参数构建。
-- 发布前运行完整的 `go test ./...`；测试失败时不发布任何产物。
+- 发布流程直接执行跨平台构建，不运行自动化测试。
