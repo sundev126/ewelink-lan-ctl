@@ -1,0 +1,22 @@
+name: ewelink-lan-ctl
+
+services:
+  ewelink-lan-ctl:
+    image: ghcr.io/sundev126/ewelink-lan-ctl:latest
+    restart: unless-stopped
+    environment:
+      EWELINK_APP_ID: ${EWELINK_APP_ID:?请设置 EWELINK_APP_ID}
+      EWELINK_APP_SECRET: ${EWELINK_APP_SECRET:?请设置 EWELINK_APP_SECRET}
+      EWELINK_CALLBACK_URL: ${EWELINK_CALLBACK_URL:-http://127.0.0.1:33998/callback}
+      EWELINK_LISTEN_ADDR: ":33998"
+      EWELINK_STATE_FILE: /data/state.json
+      EWELINK_REQUEST_TIMEOUT: ${EWELINK_REQUEST_TIMEOUT:-10s}
+      EWELINK_TOKEN_CHECK_INTERVAL: ${EWELINK_TOKEN_CHECK_INTERVAL:-12h}
+      EWELINK_TOKEN_REFRESH_AHEAD: ${EWELINK_TOKEN_REFRESH_AHEAD:-168h}
+    ports:
+      - "33998:33998"
+    volumes:
+      - ewelink-data:/data
+
+volumes:
+  ewelink-data:

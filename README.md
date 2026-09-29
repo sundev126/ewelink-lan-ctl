@@ -37,6 +37,42 @@ chmod 600 .env
 
 ## Debian 12 原生安装
 
+### 一键安装
+
+Linux amd64 可以直接使用一键安装脚本。先准备包含真实 App ID 和已轮换 App Secret 的 `.env`，再下载、检查并执行脚本：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/sundev126/ewelink-lan-ctl/main/deploy/install.sh
+chmod +x install.sh
+less install.sh
+sudo ./install.sh ./.env
+```
+
+脚本默认安装最新 Release，也可以安装指定版本：
+
+```bash
+sudo ./install.sh --version v1.0.0 ./.env
+```
+
+脚本会验证 Release 的 SHA-256 校验和，安装二进制和 systemd unit，创建 `ewelink` 专用用户，并启动服务。再次执行脚本可以升级；未传入配置文件时会保留现有 `/etc/ewelink-lan-ctl.env`，OAuth 状态始终保存在 `/var/lib/ewelink-lan-ctl/state.json`。
+
+一键卸载默认保留配置和 OAuth 状态：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/sundev126/ewelink-lan-ctl/main/deploy/uninstall.sh
+chmod +x uninstall.sh
+less uninstall.sh
+sudo ./uninstall.sh
+```
+
+只有确认不再需要配置和 OAuth 凭据时，才执行彻底清理：
+
+```bash
+sudo ./uninstall.sh --purge
+```
+
+### 手动安装
+
 安装 CA 证书和 Go 1.22 或更高版本，然后构建二进制文件。Debian 12 的基础 `golang-go` 软件包可能比本模块要求的版本旧，因此请从 [go.dev/dl](https://go.dev/dl/) 安装当前 Go 版本，而不要依赖该软件包，并在构建前确认版本。
 
 ```bash
@@ -81,17 +117,19 @@ sudo journalctl -u ewelink-lan-ctl -f
 
 ## Docker Compose
 
-Docker 在 Debian Bookworm 上使用 Go 1.22 构建并测试静态二进制文件，然后在带有 CA 证书的 Debian 12 distroless 镜像中以非 root 用户运行该文件。Docker 构建上下文会排除 `.env`、本地凭据和生成的状态。Compose 使用普通端口发布（而不是 host 网络），并将凭据持久化到挂载在 `/data` 的命名 volume 中。
+发布镜像在 Debian Bookworm 上使用 Go 1.22 构建并测试静态二进制文件，然后在带有 CA 证书的 Debian 12 distroless 镜像中以非 root 用户运行该文件。`deploy/docker-compose.yml` 使用 GitHub Container Registry 中的 `latest` 镜像、普通端口发布（而不是 host 网络），并将凭据持久化到挂载在 `/data` 的命名 volume 中。
 
 ```bash
-cp .env.example .env
-chmod 600 .env
-# 编辑 .env 并填入轮换后的新 App Secret。
-docker compose up -d --build
-docker compose logs -f ewelink-lan-ctl
+read -r -p 'EWELINK_APP_ID: ' EWELINK_APP_ID
+read -r -s -p 'EWELINK_APP_SECRET: ' EWELINK_APP_SECRET && echo
+export EWELINK_APP_ID EWELINK_APP_SECRET
+# 若回调地址不是默认值，也在当前 shell 中设置 EWELINK_CALLBACK_URL。
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml logs -f ewelink-lan-ctl
 ```
 
-无论 `.env` 中这两个值为何，Compose 都会强制设置 `EWELINK_LISTEN_ADDR=:33998` 和 `EWELINK_STATE_FILE=/data/state.json`。使用 `docker compose down` 停止容器而不删除凭据。除非确实要清除已保存的 OAuth 凭据，否则不要添加 `--volumes`。
+Compose 通过 `environment` 显式传递配置，不使用服务级 `env_file`。执行 Compose 前必须提供 `EWELINK_APP_ID` 和 `EWELINK_APP_SECRET`；推荐按上例从当前 shell 安全读取，避免将 Secret 写进命令历史。其他配置可选，并使用配置表中的默认值。Compose 始终强制设置 `EWELINK_LISTEN_ADDR=:33998` 和 `EWELINK_STATE_FILE=/data/state.json`。使用 `docker compose -f deploy/docker-compose.yml down` 停止容器而不删除凭据。除非确实要清除已保存的 OAuth 凭据，否则不要添加 `--volumes`。
 
 ## 版本发布
 

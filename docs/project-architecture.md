@@ -16,6 +16,7 @@
 - 支持标量 `params.switch` 和 `params.switches` 中的 `outlet: 0`。
 - 提供健康检查、稳定的 JSON 错误结构和脱敏日志。
 - 支持原生二进制、systemd、Docker 和 Docker Compose 部署。
+- 提供 Linux amd64 一键安装、升级和卸载脚本；卸载默认保留配置及 OAuth 状态。
 - 根目录 README 使用简体中文说明配置、部署、OAuth、API 和快捷指令用法。
 
 ## 软件结构
@@ -83,7 +84,7 @@ Token 生命周期包含以下处理：
 
 - 原生运行目标为 Debian 12，支持随附的 systemd unit。
 - Docker 使用多阶段构建；运行镜像为非 root 的 distroless 镜像，并包含 CA 证书。
-- Docker Compose 将状态保存到 `/data` 持久卷，并发布端口 `33998`。
+- `deploy/docker-compose.yml` 使用 GHCR 发布镜像，将状态保存到 `/data` 持久卷，并发布端口 `33998`。
 - 收到 SIGINT 或 SIGTERM 时停止后台任务并在限定时间内优雅关闭 HTTP 服务。
 - 推送 `v*` tag 后自动构建版本二进制、容器镜像和 GitHub Release，详见 [Tag 自动发布工作流设计](2026-09-29-tag-release-action-design.md)。
 
