@@ -93,6 +93,18 @@ docker compose logs -f ewelink-lan-ctl
 
 无论 `.env` 中这两个值为何，Compose 都会强制设置 `EWELINK_LISTEN_ADDR=:33998` 和 `EWELINK_STATE_FILE=/data/state.json`。使用 `docker compose down` 停止容器而不删除凭据。除非确实要清除已保存的 OAuth 凭据，否则不要添加 `--volumes`。
 
+## 版本发布
+
+推送以 `v` 开头的 tag 会自动创建 GitHub Release，并附带 Linux amd64、Windows amd64 二进制压缩包及 SHA-256 校验和。同时会将支持 `linux/amd64` 和 `linux/arm64` 的容器镜像发布到 GitHub Container Registry：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+docker pull ghcr.io/sundev126/ewelink-lan-ctl:v1.0.0
+```
+
+语义化版本 tag 还会生成不带 `v` 的完整版本标签和 `主版本.次版本` 标签；每次发布也会更新 `latest`。
+
 ## 初始 OAuth 授权
 
 将 `http://127.0.0.1:33998/callback` 注册为开发者应用的重定向 URL，并为 `EWELINK_CALLBACK_URL` 使用相同的值。在将要使用浏览器的计算机上，打开到服务器的 SSH 本地端口转发会话并保持运行：
