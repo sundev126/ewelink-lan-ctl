@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>充电插座</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='26' height='26' rx='7' fill='%231d8a57'/%3E%3Crect x='11' y='9' width='3' height='7' rx='1.5' fill='%23fff'/%3E%3Crect x='18' y='9' width='3' height='7' rx='1.5' fill='%23fff'/%3E%3Ccircle cx='16' cy='22' r='2.5' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/app.js" defer></script>
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div>
+      <h1>充电插座</h1>
+      <p class="summary" aria-live="polite"><span id="summary">正在读取插座…</span> <span class="updated" id="updated"></span></p>
+    </div>
+    <button type="button" class="refresh" id="refresh">刷新</button>
+  </header>
+
+  <section class="notice" id="notice" hidden>
+    <h2 id="notice-title"></h2>
+    <p id="notice-text"></p>
+    <a class="notice-action" id="notice-action" href="/oauth/start" hidden>绑定 eWeLink 账号</a>
+  </section>
+
+  <main>
+    <ul class="plates" id="plates" aria-label="插座列表"></ul>
+    <p class="empty" id="empty" hidden>账号下没有可控制的单路插座。在易微联 App 中添加插座后，点击刷新。</p>
+  </main>
+
+  <footer class="footer" id="footer" hidden>
+    <a href="/oauth/start">更换绑定的 eWeLink 账号</a>
+  </footer>
+</div>
+
+<template id="plate-template">
+  <li class="plate">
+    <div class="plate-info">
+      <h2 class="plate-name"></h2>
+      <p class="plate-status"><span class="led" aria-hidden="true"></span><span class="plate-status-text"></span></p>
+      <p class="plate-message" role="status"></p>
+    </div>
+    <div class="rocker" role="group">
+      <button type="button" class="rocker-side" data-state="on">开</button>
+      <button type="button" class="rocker-side" data-state="off">关</button>
+    </div>
+    <details class="plate-details">
+      <summary>快捷指令设置</summary>
+      <dl>
+        <dt>设备 ID</dt>
+        <dd class="device-id"></dd>
+        <dt>型号</dt>
+        <dd class="device-model"></dd>
+      </dl>
+      <label class="url-label">开关地址
+        <span class="url-row">
+          <input class="switch-url" type="text" readonly spellcheck="false">
+          <button type="button" class="copy">复制</button>
+        </span>
+      </label>
+      <p class="hint">在快捷指令的“获取 URL 内容”中使用 PUT 方法，请求体为 JSON，字段 state 填 on 或 off。</p>
+    </details>
+  </li>
+</template>
+
+<noscript><p class="page">控制面板需要启用 JavaScript。</p></noscript>
+</body>
+</html>

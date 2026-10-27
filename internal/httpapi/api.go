@@ -18,6 +18,7 @@ import (
 	"github.com/zm/ewelink-lan-ctl/internal/ewelink"
 	"github.com/zm/ewelink-lan-ctl/internal/store"
 	"github.com/zm/ewelink-lan-ctl/internal/token"
+	"github.com/zm/ewelink-lan-ctl/internal/webui"
 )
 
 const (
@@ -96,7 +97,12 @@ func New(config Config) http.Handler {
 	mux.HandleFunc("GET /api/v1/devices", exactMethod(http.MethodGet, a.devices))
 	mux.HandleFunc("GET /api/v1/devices/{device_id}/status", exactMethod(http.MethodGet, a.status))
 	mux.HandleFunc("PUT /api/v1/devices/{device_id}/switch", exactMethod(http.MethodPut, a.setSwitch))
+	ui := webui.Handler()
+	mux.HandleFunc("GET /{$}", exactMethod(http.MethodGet, ui.ServeHTTP))
+	mux.HandleFunc("GET /assets/", exactMethod(http.MethodGet, ui.ServeHTTP))
 	getOnly := methodNotAllowed(http.MethodGet)
+	mux.HandleFunc("/{$}", getOnly)
+	mux.HandleFunc("/assets/", getOnly)
 	mux.HandleFunc("/healthz", getOnly)
 	mux.HandleFunc("/oauth/start", getOnly)
 	mux.HandleFunc("/callback", getOnly)
@@ -364,7 +370,8 @@ func (a *api) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, "<!doctype html><html><body>Authorization complete. You may close this window.</body></html>\n")
+	_, _ = io.WriteString(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>授权完成</title></head>`+
+		`<body><p>授权完成。<a href="/">返回控制面板</a></p></body></html>`+"\n")
 }
 
 func oneQueryValue(values []string) (string, bool) {

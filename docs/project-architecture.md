@@ -15,6 +15,7 @@
 - 以幂等的 `on`、`off` 操作控制开关，不提供 `toggle`。
 - 支持标量 `params.switch` 和 `params.switches` 中的 `outlet: 0`。
 - 提供健康检查、稳定的 JSON 错误结构和脱敏日志。
+- 内置网页控制面板，可查看插座状态、手动开关、绑定账号并复制快捷指令地址，详见 [网页控制面板设计](2026-10-27-web-gui-design.md)。
 - 支持原生二进制、systemd、Docker 和 Docker Compose 部署。
 - 提供 Linux amd64 一键安装、升级和卸载脚本；卸载默认保留配置及 OAuth 状态。
 - 根目录 README 使用简体中文说明配置、部署、OAuth、API 和快捷指令用法。
@@ -28,7 +29,8 @@
 | `internal/ewelink` | OAuth 签名、区域 API 客户端、家庭及设备访问、Token 失败重试 |
 | `internal/token` | Token 生命周期、定时刷新和并发刷新合并 |
 | `internal/store` | OAuth 凭据的安全、原子化 JSON 持久化 |
-| `internal/httpapi` | OAuth、健康检查和设备 REST API |
+| `internal/httpapi` | OAuth、健康检查、设备 REST API 和控制面板路由 |
+| `internal/webui` | 编译进二进制的网页控制面板静态文件 |
 
 所有云端请求均使用可取消的 context 和可配置超时时间。客户端在进程内限制请求间隔，避免短时间内并发请求直接冲击上游服务。设备、家庭和设备状态均不缓存。
 
@@ -58,6 +60,8 @@ Token 生命周期包含以下处理：
 
 | 方法与路径 | 功能 |
 | --- | --- |
+| `GET /` | 网页控制面板 |
+| `GET /assets/app.css`、`GET /assets/app.js` | 控制面板静态资源 |
 | `GET /healthz` | 返回进程和 OAuth 就绪状态 |
 | `GET /oauth/start` | 启动 OAuth 授权 |
 | `GET /callback` | 接收 OAuth 回调 |
@@ -65,7 +69,7 @@ Token 生命周期包含以下处理：
 | `GET /api/v1/devices/{device_id}/status` | 实时读取一个设备的状态 |
 | `PUT /api/v1/devices/{device_id}/switch` | 将一个设备显式设置为 `on` 或 `off` |
 
-`/api/v1` 接口有意不实现调用方认证。部署时必须通过可信 LAN、VPN 或带认证的反向代理限制访问，不能直接暴露到互联网。能够访问服务的调用者也可以启动 OAuth 并重新绑定账号。
+`/api/v1` 接口和控制面板有意不实现调用方认证。部署时必须通过可信 LAN、VPN 或带认证的反向代理限制访问，不能直接暴露到互联网。能够访问服务的调用者也可以启动 OAuth 并重新绑定账号。
 
 错误响应使用稳定结构：
 
